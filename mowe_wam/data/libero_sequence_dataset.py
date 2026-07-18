@@ -356,6 +356,12 @@ def build_episode_windows(
             ),
             "expert_label_source": skill_sources,
         }
+        # The resumable converter stores this exact TFDS source identity.  It
+        # is more stable than the lightweight image-derived episode fingerprint
+        # when auditing a remounted RLDS copy on another server.
+        if "source_file_key" in current and "source_traj_index" in current:
+            output["source_file_key"] = str(current["source_file_key"])
+            output["source_traj_index"] = int(current["source_traj_index"])
         if "proprio" in current:
             output["proprio"] = current["proprio"].float()
         yield output

@@ -8,6 +8,7 @@ import copy
 import json
 import random
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -165,6 +166,16 @@ def _set_rng(torch, seed: int, device: str) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _source_episode_identity(sample):
+    """Return the exact TFDS source key recorded by formal conversion, if present."""
+
+    file_key = sample.get("source_file_key")
+    trajectory_index = sample.get("source_traj_index")
+    if file_key is None or trajectory_index is None:
+        return None
+    return (str(file_key), int(trajectory_index))
+
+
 def main() -> None:
     args = parse_args()
     if args.samples < 1:
@@ -241,10 +252,13 @@ def main() -> None:
     sample_count = min(args.samples, len(cached_dataset))
     selected_indices = random.Random(args.seed).sample(range(len(cached_dataset)), sample_count)
     cached_samples = {index: cached_dataset[index] for index in selected_indices}
-    pair_to_cached = {
-        (sample["episode_id"], int(sample["step_id"])): sample
-        for sample in cached_samples.values()
-    }
+    source_to_indices = defaultdict(list)
+    pair_to_indices = defaultdict(list)
+    for index, sample in cached_samples.items():
+        source_identity = _source_episode_identity(sample)
+        if source_identity is not None:
+            source_to_indices[(source_identity, int(sample["step_id"]))].append(index)
+        pair_to_indices[(sample["episode_id"], int(sample["step_id"]))].append(index)
     raw_dataset = _build_flow_dataset(
         online_cfg,
         online_model,
@@ -258,6 +272,8 @@ def main() -> None:
     collator = LatentWAMCollator()
     records = []
     found = set()
+    source_matches = 0
+    episode_id_matches = 0
     device = str(online_cfg["training"].get("device", "auto"))
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -279,9 +295,20 @@ def main() -> None:
     with torch.no_grad():
         for raw_sample in raw_dataset:
             pair = (raw_sample["episode_id"], int(raw_sample["step_id"]))
-            if pair not in pair_to_cached:
+            source_identity = _source_episode_identity(raw_sample)
+            candidates = source_to_indices.get(
+                (source_identity, int(raw_sample["step_id"])), []
+            )
+            matching_mode = "source_identity"
+            if len(candidates) != 1:
+                candidates = pair_to_indices.get(pair, [])
+                matching_mode = "episode_id"
+            if len(candidates) != 1:
                 continue
-            cached_sample = pair_to_cached[pair]
+            cached_index = candidates[0]
+            if cached_index in found:
+                continue
+            cached_sample = cached_samples[cached_index]
             raw_batch = collator([raw_sample])
             cached_batch = collator([cached_sample])
             raw_context = online_model.backbone.extract_context_features(
@@ -406,10 +433,24 @@ def main() -> None:
                     ),
                 }
             )
-            found.add(pair)
+            found.add(cached_index)
+            if matching_mode == "source_identity":
+                source_matches += 1
+            else:
+                episode_id_matches += 1
             if len(found) == sample_count:
                 break
-    missing = sorted(set(pair_to_cached) - found)
+    missing_indices = sorted(set(cached_samples) - found)
+    missing = [
+        (
+            cached_samples[index]["episode_id"],
+            int(cached_samples[index]["step_id"]),
+        )
+        for index in missing_indices
+    ]
+    missing_source_identities = [
+        _source_episode_identity(cached_samples[index]) for index in missing_indices
+    ]
     max_feature = max(
         (value["max_abs"] for record in records for value in record["feature_errors"].values()),
         default=float("inf"),
@@ -450,6 +491,17 @@ def main() -> None:
         "requested_samples": args.samples,
         "compared_samples": len(records),
         "missing_pairs": [list(value) for value in missing],
+        "missing_source_episode_identities": [
+            list(value) if value is not None else None for value in missing_source_identities
+        ],
+        "matching": {
+            "source_identity_matches": source_matches,
+            "episode_id_fallback_matches": episode_id_matches,
+            "source_identity_available_for_selected": sum(
+                _source_episode_identity(sample) is not None
+                for sample in cached_samples.values()
+            ),
+        },
         "tolerances": {
             "feature_atol": args.feature_atol,
             "output_atol": args.output_atol,

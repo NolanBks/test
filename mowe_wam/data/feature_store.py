@@ -815,6 +815,8 @@ class MoWEFeatureWindowDataset(_DatasetBase):
             "expert_label_source": [
                 "sidecar" if int(value) != UNKNOWN_SKILL else "unknown" for value in skill_labels
             ],
+            "source_file_key": episode.get("source_file_key"),
+            "source_traj_index": episode.get("source_traj_index"),
         }
 
     def close(self) -> None:

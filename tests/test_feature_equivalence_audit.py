@@ -5,6 +5,7 @@ import torch
 from scripts.audit_feature_store_equivalence import (
     _feature_gate_error,
     _output_gate_error,
+    _source_episode_identity,
     _tensor_error,
 )
 
@@ -62,6 +63,15 @@ class FeatureEquivalenceAuditTests(unittest.TestCase):
         }
 
         self.assertAlmostEqual(_output_gate_error(errors), 0.004)
+
+    def test_source_episode_identity_requires_both_provenance_fields(self):
+        self.assertEqual(
+            _source_episode_identity(
+                {"source_file_key": "suite/file.tfrecord", "source_traj_index": 17}
+            ),
+            ("suite/file.tfrecord", 17),
+        )
+        self.assertIsNone(_source_episode_identity({"source_file_key": "file"}))
 
 
 if __name__ == "__main__":

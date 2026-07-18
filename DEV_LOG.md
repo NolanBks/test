@@ -36,6 +36,7 @@
 - 单卡 A100 已分别完成原始-backbone Stage 1/2/3 step 0→100 工程验证：checkpoint stage/lineage 正确、loss/gradient 有限、Stage 2 六个 motor expert 与 Stage 3 router 梯度合同通过。它们不是正式 8 卡 lineage 的初始化 checkpoint。
 - `start_mtp.py` 已实现单入口 8 卡正式训练编排与断点恢复，并配套 `docs/MTP_ONE_CLICK_TRAINING.md`；当前只有 dry-run/合同测试证据，尚未在真实 8 卡节点完整执行该 launcher。
 - 对于 MTP 未开放 `/proc`/cgroup 的容器，launcher 现提供显式 `--disable-system-monitoring` 降级模式：跳过系统/cgroup/OOM/boot 资源证据，保留 CUDA、NCCL、GPU 显存、数据和训练质量门槛；其报告会明确标注为 degraded，不能与标准 cgroup 证据混用。
+- raw/cache equivalence 的 raw matcher 现优先使用 formal store 已记录的精确 `(source_file_key, source_traj_index, step_id)`，只有旧 store 缺少该 provenance 时才回退图像摘要 `episode_id`；这修复跨服务器同计数/同 manifest 下的少量 image-fingerprint missing pair，不会放宽 100/100 gate。
 
 ### 尚未完成
 
@@ -446,6 +447,38 @@ git diff --check
 ### Next
 
 - 在无权限服务器用同一命令追加 `--disable-system-monitoring` 重新 dry-run，再正式启动；同时用 MTP 控制台外部观察系统 RAM、GPU memory 和进程被杀事件。
+
+## 2026-07-19 - 跨服务器 equivalence 精确 source identity 匹配
+
+### Goal
+
+修复 formal store 与重新挂载的同 fingerprint RLDS 在 raw/cache 100-window audit 中出现少量 image-derived `episode_id` missing pair 的问题。
+
+### Changed
+
+- raw LIBERO window 现在保留 sidecar overlay 已注入的 `source_file_key` 与 `source_traj_index`。
+- feature-store window 暴露 converter 已存储的同一 provenance；equivalence audit 优先以 source identity 加 step 精确匹配，旧 store 才回退 image-derived episode ID，并在报告中写出匹配统计/缺失 source identity。
+
+### Commands Run
+
+```bash
+PYTHONPATH=tests:. python -m unittest tests.test_feature_equivalence_audit tests.test_start_mtp
+python -m compileall -q mowe_wam scripts tests start_mtp.py
+git diff --check
+```
+
+### Result
+
+- 6 项 equivalence/launcher 专项测试通过，新增 source-identity helper 回归覆盖。
+- 用户服务器原报告的 95 个已比较窗口全部在 feature/output/loss gate 内；5 个 missing pair 是唯一失败原因。新 matcher 不放宽数值或 100-window 完整性要求。
+
+### Issues
+
+- 需要先将上述代码同步到目标 8 卡服务器，并在该节点实跑一次 equivalence；当前没有该节点的新报告。
+
+### Next
+
+- 先确认 `episodes.jsonl` 有 1,693 条 source provenance，再用单卡重跑同 seed 的 100-window audit；通过后以同一 run-id 重启 launcher。
 
 ## 日志维护规则
 
