@@ -1217,6 +1217,18 @@ def configure_flow_stage(model, stage: str) -> None:
         component.train(is_enabled)
         for parameter in component.parameters():
             parameter.requires_grad_(is_enabled)
+    # The nominal flow trunk never receives a per-token motion condition;
+    # that projection exists only because nominal and residual flows share the
+    # ActionFlowTrunk implementation. Leaving these parameters trainable makes
+    # DDP fail on the second iteration with an unfinished reduction.
+    for parameter in model.nominal_action_head.flow_trunk.token_condition_projection.parameters():
+        parameter.requires_grad_(False)
+    # Stage 1 has no router loss and keeps the router frozen. The route-world
+    # projection therefore has no gradient path until Stage 2/3, while the
+    # future/delta heads remain supervised by the Stage-1 world losses.
+    if stage == "nominal_flow_pretrain":
+        for parameter in model.world_model.route_world_head.parameters():
+            parameter.requires_grad_(False)
     freeze = getattr(model.backbone, "freeze", None)
     if freeze is not None:
         freeze()

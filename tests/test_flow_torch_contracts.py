@@ -573,6 +573,60 @@ class FlowTorchTests(unittest.TestCase):
         self.assertEqual(first["batches"], 1)
         self.assertIn("total_loss", first["metrics"])
 
+    def test_stage1_has_no_trainable_parameter_without_gradient(self):
+        cfg = load_config("configs/mowe_wam/train_nominal_flow_wam.yaml")
+        configure_flow_stage(self.model, "nominal_flow_pretrain")
+        self.assertFalse(
+            any(
+                parameter.requires_grad
+                for parameter in self.model.nominal_action_head.flow_trunk.token_condition_projection.parameters()
+            )
+        )
+        self.assertFalse(
+            any(
+                parameter.requires_grad
+                for parameter in self.model.world_model.route_world_head.parameters()
+            )
+        )
+
+        output = self.model(
+            self.batch,
+            action_condition_mode="ground_truth",
+            route_mode="predicted",
+            flow_seed=7,
+            compute_residual=False,
+        )
+        losses = flow_wam_skill_losses(
+            output,
+            self.batch,
+            cfg["loss_weights"],
+            stage="nominal_flow_pretrain",
+        )
+        losses["total_loss"].backward()
+        missing = [
+            name
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        self.assertEqual(missing, [])
+
+    def test_route_world_head_reenabled_after_stage1(self):
+        for stage in ("expert_warmstart", "joint"):
+            with self.subTest(stage=stage):
+                configure_flow_stage(self.model, stage)
+                self.assertTrue(
+                    all(
+                        parameter.requires_grad
+                        for parameter in self.model.world_model.route_world_head.parameters()
+                    )
+                )
+                self.assertFalse(
+                    any(
+                        parameter.requires_grad
+                        for parameter in self.model.nominal_action_head.flow_trunk.token_condition_projection.parameters()
+                    )
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

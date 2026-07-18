@@ -37,6 +37,7 @@
 - `start_mtp.py` 已实现单入口 8 卡正式训练编排与断点恢复，并配套 `docs/MTP_ONE_CLICK_TRAINING.md`；当前只有 dry-run/合同测试证据，尚未在真实 8 卡节点完整执行该 launcher。
 - 对于 MTP 未开放 `/proc`/cgroup 的容器，launcher 现提供显式 `--disable-system-monitoring` 降级模式：跳过系统/cgroup/OOM/boot 资源证据，保留 CUDA、NCCL、GPU 显存、数据和训练质量门槛；其报告会明确标注为 degraded，不能与标准 cgroup 证据混用。
 - raw/cache equivalence 的 raw matcher 现优先使用 formal store 已记录的精确 `(source_file_key, source_traj_index, step_id)`，只有旧 store 缺少该 provenance 时才回退图像摘要 `episode_id`；这修复跨服务器同计数/同 manifest 下的少量 image-fingerprint missing pair，不会放宽 100/100 gate。
+- 真实 8×GPU Stage 1 step 0→2 首次运行在完成 step 1 后触发 DDP unused-parameter reducer 错误；参数索引已精确映射为 nominal trunk 的可选 `token_condition_projection` 与 Stage-1 无监督的 `world_model.route_world_head`，stage 配置现按真实梯度路径冻结它们，Stage 2/3 会重新启用 route-world head。
 
 ### 尚未完成
 
@@ -479,6 +480,40 @@ git diff --check
 ### Next
 
 - 先确认 `episodes.jsonl` 有 1,693 条 source provenance，再用单卡重跑同 seed 的 100-window audit；通过后以同一 run-id 重启 launcher。
+
+## 2026-07-19 - 修复 Stage 1 第二步 DDP unused parameters
+
+### Goal
+
+处理真实 8 卡 Stage 1 在成功完成第一个 optimizer step 后，于第二次 forward 前报 `Expected to have finished reduction` 的错误。
+
+### Changed
+
+- 根据正式配置的 DDP 参数索引，确认 `52/53` 为 nominal trunk 的 `token_condition_projection`，该分支只供 residual expert 使用，nominal head 永不传 token condition，因此始终冻结。
+- 确认 `168/169` 为 `world_model.route_world_head`；Stage 1 router 冻结且无 route loss，因此 Stage 1 冻结该 head，Stage 2/3 自动重新启用。
+- 未开启全局 `find_unused_parameters=true`，避免隐藏未来新的断梯度问题和增加 DDP 遍历开销。
+- 增加 Stage 1 全部 trainable 参数必须获得梯度、Stage 2/3 route-world head 恢复启用的合同测试。
+
+### Commands Run
+
+```bash
+PYTHONPATH=tests:. python -m unittest tests.test_feature_equivalence_audit tests.test_start_mtp
+python -m compileall -q mowe_wam scripts tests start_mtp.py
+git diff --check
+```
+
+### Result
+
+- 用户真实日志证明 8 卡 NCCL、effective batch 8、Stage 1 第一步有限 loss/gradients 均正常；失败参数在 8 ranks 完全一致，排除随机 rank 数据差异。
+- 正式模型参数索引映射精确得到 `52/53=token_condition_projection`、`168/169=route_world_head`；equivalence/launcher 6 项专项测试、compileall 和 diff check 通过。
+
+### Issues
+
+- 当前本地容器的 CPU multiprocessing/large synthetic backward 测试被环境级进程阻塞提前终止，尚未替代目标节点真实 8 卡 step 0→2 重跑证据。
+
+### Next
+
+- 将修复同步到目标节点，备份或清理未到 step 2 的 Stage 1 失败目录，以相同 run-id 重启 launcher；必须先看到 step 2 checkpoint 正常写出，再由 launcher 自动继续 2→25。
 
 ## 日志维护规则
 
