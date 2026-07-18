@@ -1,0 +1,11 @@
+{
+  "variant": "oracle_future_memory_moe",
+  "router": {
+    "enabled": true,
+    "inputs": ["features", "oracle_future_predicates", "oracle_progress_delta", "oracle_future_risk", "oracle_event_memory"],
+    "use_future_prediction": true,
+    "use_event_memory": true,
+    "use_oracle_future": true
+  },
+  "notes": "Non-deployable upper bound using offline future labels and oracle memory snapshots."
+}

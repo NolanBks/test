@@ -1,0 +1,9 @@
+{
+  "variant": "dense_baseline",
+  "router": {
+    "enabled": false,
+    "inputs": [],
+    "use_oracle_predicates": false
+  },
+  "notes": "No MoE; use upstream action head or a single dense local head."
+}

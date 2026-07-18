@@ -1,0 +1,8 @@
+{
+  "name": "OpenVLA-OFT",
+  "upstream_repo": "external/openvla-oft",
+  "upstream_commit": "e4287e9",
+  "setup_doc": "external/openvla-oft/SETUP.md",
+  "libero_doc": "external/openvla-oft/LIBERO.md",
+  "feature_extraction_status": "TBD"
+}

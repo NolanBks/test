@@ -1,0 +1,9 @@
+{
+  "variant": "world_predicted_moe",
+  "router": {
+    "enabled": true,
+    "inputs": ["features", "world_predicted_predicates", "progress", "risk"],
+    "use_oracle_predicates": false
+  },
+  "notes": "Main MoWE-WAM deployable variant."
+}

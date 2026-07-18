@@ -1,0 +1,9 @@
+{
+  "variant": "current_predicate_moe",
+  "router": {
+    "enabled": true,
+    "inputs": ["features", "current_predicates"],
+    "use_oracle_predicates": false
+  },
+  "notes": "Router uses current predicted predicates without future-horizon routing."
+}

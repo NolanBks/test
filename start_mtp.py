@@ -1,0 +1,1214 @@
+#!/usr/bin/env python3
+"""MoWE 8-GPU formal training launcher with fail-closed audits and resume.
+
+This file is intentionally self-contained so managed training platforms can
+launch the complete MoWE pipeline through one Python entrypoint. Re-running the
+same command resumes from the newest stage checkpoint and regenerates any
+checkpoint-bound readiness attestation that is no longer current.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import signal
+import shlex
+import socket
+import subprocess
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+SCRIPT_ROOT = Path(__file__).resolve().parent
+MOTOR_SKILLS = (
+    "pick_grasp",
+    "place_release",
+    "move_transport",
+    "open_close",
+    "turn_rotate",
+    "push_pull",
+)
+ALL_SKILLS = (*MOTOR_SKILLS, "null_finish")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def atomic_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def same_path(left: Any, right: Path) -> bool:
+    if left in {None, ""}:
+        return False
+    return Path(str(left)).expanduser().resolve() == right.expanduser().resolve()
+
+
+def current_node_identity() -> dict[str, Any]:
+    if os.environ.get("MOWE_DISABLE_SYSTEM_MONITORING", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return {"system_monitoring_disabled": True}
+    boot = Path("/proc/sys/kernel/random/boot_id")
+    membership = Path("/proc/self/cgroup")
+    rendered = membership.read_text(encoding="utf-8").strip() if membership.exists() else None
+    return {
+        "hostname": socket.gethostname(),
+        "boot_id": boot.read_text(encoding="utf-8").strip() if boot.exists() else None,
+        "cgroup_membership_sha256": (
+            hashlib.sha256(rendered.encode("utf-8")).hexdigest() if rendered else None
+        ),
+    }
+
+
+def node_report_is_current(
+    path: Path,
+    *,
+    world_size: int,
+    store: Path | None = None,
+    expected_limits: dict[str, float] | None = None,
+) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        report = load_json(path)
+        runtime = report.get("runtime_identity", {})
+        node = runtime.get("node", {})
+        current = current_node_identity()
+        monitoring_disabled = current.get("system_monitoring_disabled") is True
+        identity_matches = (
+            bool(report.get("passed", True))
+            and int(runtime.get("rank_count", 0)) == world_size
+            and (
+                node.get("system_monitoring_disabled") is True
+                if monitoring_disabled
+                else all(node.get(key) == current.get(key) for key in current)
+            )
+        )
+        if not identity_matches:
+            return False
+        if store is not None and not same_path(report.get("store"), store):
+            return False
+        if expected_limits is not None:
+            observed = report.get("limits") or report.get("resource_guard_thresholds") or {}
+            if any(
+                not math.isclose(
+                    float(observed.get(name, float("inf"))),
+                    float(value),
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                for name, value in expected_limits.items()
+            ):
+                return False
+        return True
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def report_matches_store(path: Path, store: Path, *, kind: str, samples: int = 0) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        report = load_json(path)
+        if kind == "feature":
+            assignment = report.get("assignment", {})
+            return (
+                report.get("valid") is True
+                and report.get("formal_training_ready") is True
+                and report.get("checksums_verified") is True
+                and same_path(report.get("root"), store)
+                and int(assignment.get("world_size", 0)) == 8
+                and assignment.get("episode_union_complete") is True
+                and not assignment.get("episode_overlap")
+                and assignment.get("target_skill_union_complete") is True
+                and all(
+                    assignment.get("imbalance_checks", {}).get(name) is True
+                    for name in ("windows", "suites", "skills")
+                )
+            )
+        if kind == "equivalence":
+            return (
+                report.get("passed") is True
+                and same_path(report.get("store"), store)
+                and int(report.get("compared_samples", 0)) >= samples
+                and not report.get("missing_pairs")
+                and report.get("masks_match") is True
+                and report.get("comparison_contract", {}).get("name")
+                == "mask_aware_training_metric_v1"
+            )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return False
+
+
+def checkpoint_metadata(path: Path, expected_stage: str | None = None) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    sidecar = path.with_suffix(path.suffix + ".metadata.json")
+    if not sidecar.is_file():
+        raise RuntimeError(f"Checkpoint metadata sidecar is missing: {sidecar}")
+    metadata = load_json(sidecar)
+    if metadata.get("format") != "flow_wam_skill_components_v2":
+        raise RuntimeError(f"Unsupported checkpoint format: {path}")
+    if expected_stage is not None and metadata.get("stage") != expected_stage:
+        raise RuntimeError(
+            f"Checkpoint stage mismatch: {metadata.get('stage')!r} != {expected_stage!r}: {path}"
+        )
+    return metadata
+
+
+def jsonl_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def finite_tree(value: Any) -> bool:
+    if isinstance(value, dict):
+        return all(finite_tree(item) for item in value.values())
+    if isinstance(value, list):
+        return all(finite_tree(item) for item in value)
+    return not isinstance(value, float) or math.isfinite(value)
+
+
+class Launcher:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.repo = args.repo_root.resolve()
+        self.run_root = (args.run_root_dir / args.run_id).resolve()
+        self.report_root = (args.report_root or self.run_root / "reports").resolve()
+        self.stage_root = (args.stage_root or self.run_root / "ddp8").resolve()
+        self.state_path = self.run_root / "launcher_state.json"
+        self.state = load_json(self.state_path) if self.state_path.is_file() else {
+            "format": "mowe_mtp_launcher_state_v1",
+            "created_at": utc_now(),
+            "tasks": {},
+        }
+        self.python = str(args.python.resolve()) if args.python else sys.executable
+        self.gpus = args.cuda_devices.split(",")
+        self.virtual_checkpoints: dict[str, dict[str, Any]] = {}
+        self.runtime_configs: dict[str, str] = {}
+        self.env = os.environ.copy()
+        self.env.update(
+            {
+                "CUDA_VISIBLE_DEVICES": args.cuda_devices,
+                "TOKENIZERS_PARALLELISM": "false",
+                "TF_CPP_MIN_LOG_LEVEL": "2",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "PYTHONUNBUFFERED": "1",
+                "PYTHONPATH": os.pathsep.join(
+                    filter(
+                        None,
+                        (
+                            str(self.repo),
+                            str(self.repo / "external/openvla-oft"),
+                            self.env.get("PYTHONPATH"),
+                        ),
+                    )
+                ),
+            }
+        )
+        if args.disable_system_monitoring:
+            self.env["MOWE_DISABLE_SYSTEM_MONITORING"] = "1"
+            os.environ["MOWE_DISABLE_SYSTEM_MONITORING"] = "1"
+
+    def save_state(self) -> None:
+        self.state["updated_at"] = utc_now()
+        self.state["run_id"] = self.args.run_id
+        self.state["paths"] = {
+            "repo_root": str(self.repo),
+            "data_root": str(self.args.data_root),
+            "feature_store": str(self.args.feature_store),
+            "openvla_checkpoint": str(self.args.openvla_checkpoint),
+            "dino_checkpoint": str(self.args.dino_checkpoint),
+            "skill_sidecar": str(self.args.skill_sidecar),
+            "run_root": str(self.run_root),
+        }
+        atomic_json(self.state_path, self.state)
+
+    def record(self, name: str, **values: Any) -> None:
+        task = self.state.setdefault("tasks", {}).setdefault(name, {})
+        task.update(values)
+        self.save_state()
+
+    def run(self, name: str, command: list[str], log_path: Path | None = None) -> None:
+        rendered = shlex.join(command)
+        print(f"\n[{utc_now()}] START {name}\n{rendered}", flush=True)
+        if self.args.dry_run:
+            self.record(name, status="dry_run", command=command, log=str(log_path) if log_path else None)
+            return
+        log_path = log_path or self.report_root / f"{name}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.record(name, status="running", started_at=utc_now(), command=command, log=str(log_path))
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n[{utc_now()}] COMMAND {rendered}\n")
+            handle.flush()
+            process = subprocess.Popen(
+                command,
+                cwd=self.repo,
+                env=self.env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+            previous_handlers = {}
+
+            def forward(signum, _frame):
+                self.record(name, status="terminating", signal=signum, updated_at=utc_now())
+                try:
+                    os.killpg(process.pid, signum)
+                except ProcessLookupError:
+                    pass
+
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, forward)
+            try:
+                assert process.stdout is not None
+                for line in process.stdout:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    handle.write(line)
+                    handle.flush()
+            except KeyboardInterrupt:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=30)
+                raise
+            finally:
+                for signum, handler in previous_handlers.items():
+                    signal.signal(signum, handler)
+            returncode = process.wait()
+        self.record(name, status="complete" if returncode == 0 else "failed", completed_at=utc_now(), returncode=returncode)
+        if returncode != 0:
+            raise RuntimeError(f"Task {name!r} failed with exit code {returncode}; see {log_path}")
+
+    def python_command(self, script: str, *values: Any) -> list[str]:
+        return [self.python, str(self.repo / script), *(str(value) for value in values)]
+
+    def torchrun_command(self, script: str, *values: Any) -> list[str]:
+        return [
+            self.python,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nnodes=1",
+            f"--nproc-per-node={self.args.world_size}",
+            str(self.repo / script),
+            *(str(value) for value in values),
+        ]
+
+    def preflight(self) -> None:
+        required = {
+            "repository": self.repo,
+            "feature store": self.args.feature_store,
+            "RLDS data root": self.args.data_root,
+            "OpenVLA snapshot": self.args.openvla_checkpoint,
+            "DINO snapshot": self.args.dino_checkpoint,
+            "skill sidecar": self.args.skill_sidecar,
+        }
+        for label, path in required.items():
+            if not path.exists():
+                raise FileNotFoundError(f"{label} does not exist: {path}")
+        if self.args.python is not None and not self.args.python.is_file():
+            raise FileNotFoundError(f"Python executable does not exist: {self.args.python}")
+        for relative in (
+            self.args.stage1_config,
+            self.args.stage2_config,
+            self.args.stage3_config,
+            "scripts/audit_mowe_feature_store.py",
+            "scripts/audit_feature_store_equivalence.py",
+            "scripts/soak_mowe_feature_store.py",
+            "scripts/audit_ddp_runtime.py",
+            "scripts/audit_long_training_readiness.py",
+        ):
+            if not (self.repo / relative).is_file():
+                raise FileNotFoundError(f"Required repository file is missing: {relative}")
+        if len(self.gpus) != self.args.world_size or len(set(self.gpus)) != self.args.world_size:
+            raise ValueError("--cuda-devices must contain exactly --world-size unique device IDs.")
+        if self.args.world_size != 8:
+            raise ValueError("The current formal contract requires --world-size 8.")
+        if len(self.args.openvla_revision) != 40 or any(
+            character not in "0123456789abcdef" for character in self.args.openvla_revision.lower()
+        ):
+            raise ValueError("--openvla-revision must be a 40-character hexadecimal commit.")
+        if not 100 <= self.args.equivalence_samples:
+            raise ValueError("Formal training requires --equivalence-samples >= 100.")
+        if not 1 <= self.args.stage1_pilot_step < self.args.stage1_max_steps:
+            raise ValueError("Require 1 <= stage1-pilot-step < stage1-max-steps.")
+        if min(self.args.stage1_max_steps, self.args.stage2_max_steps, self.args.stage3_max_steps) < 100:
+            raise ValueError("Every formal stage must contain at least the 100-step smoke gate.")
+        if not 0.0 <= self.args.stage1_min_copy_improvement < 1.0:
+            raise ValueError("--stage1-min-copy-improvement must be in [0,1).")
+        if not self.args.dry_run and not self.args.disable_system_monitoring:
+            for path in (
+                Path("/sys/fs/cgroup/cgroup.controllers"),
+                Path("/sys/fs/cgroup/memory.current"),
+                Path("/sys/fs/cgroup/memory.max"),
+                Path("/sys/fs/cgroup/memory.events"),
+            ):
+                if not path.is_file():
+                    raise RuntimeError(f"Required cgroup-v2 metric is unavailable: {path}")
+            probe = subprocess.run(
+                [
+                    self.python,
+                    "-c",
+                    "import torch; print(torch.cuda.device_count()); "
+                    "assert torch.cuda.device_count() == 8, torch.cuda.device_count()",
+                ],
+                cwd=self.repo,
+                env=self.env,
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            if probe.returncode != 0:
+                raise RuntimeError(f"Eight-GPU preflight failed: {probe.stdout}{probe.stderr}")
+        self.run_root.mkdir(parents=True, exist_ok=True)
+        self.report_root.mkdir(parents=True, exist_ok=True)
+        self.stage_root.mkdir(parents=True, exist_ok=True)
+        self.prepare_runtime_configs()
+        self.record("preflight", status="complete" if not self.args.dry_run else "dry_run", node=current_node_identity())
+
+    def prepare_runtime_configs(self) -> None:
+        """Freeze inherited configs and launcher overrides into run-local JSON files."""
+
+        sys.path.insert(0, str(self.repo))
+        from mowe_wam.utils.config import load_config
+
+        specifications = {
+            "stage1": (self.args.stage1_config, self.args.stage1_max_steps),
+            "stage2": (self.args.stage2_config, self.args.stage2_max_steps),
+            "stage3": (self.args.stage3_config, self.args.stage3_max_steps),
+        }
+        config_root = self.run_root / "configs"
+        for name, (source, max_steps) in specifications.items():
+            config = load_config(str(self.repo / source))
+            config["output_dir"] = str((self.stage_root / name).resolve())
+            config["data"]["feature_store_path"] = str(self.args.feature_store.resolve())
+            config["backbone"]["checkpoint"] = str(self.args.openvla_checkpoint.resolve())
+            config["backbone"]["revision"] = self.args.openvla_revision
+            config["teacher"]["checkpoint"] = str(self.args.dino_checkpoint.resolve())
+            config["skill_expert_config"] = str(
+                self.args.skill_config.resolve()
+                if self.args.skill_config is not None
+                else (self.report_root / "skill_experts_h16.json").resolve()
+            )
+            config["flow"]["num_inference_steps"] = self.args.flow_solver_steps
+            config["training"].update(
+                {
+                    "max_steps": max_steps,
+                    "grad_accumulation_steps": 1,
+                    "precision": "bf16",
+                }
+            )
+            config["training"]["distributed"].update(
+                {
+                    "enabled": "auto",
+                    "backend": "nccl",
+                    "require_cgroup_metrics": not self.args.disable_system_monitoring,
+                    "memory_guard_fraction": self.args.memory_guard_fraction,
+                    "gpu_memory_guard_fraction": self.args.gpu_memory_guard_fraction,
+                }
+            )
+            destination = config_root / f"{name}.json"
+            atomic_json(destination, config)
+            self.runtime_configs[name] = str(destination)
+
+    def ensure_skill_config(self) -> Path:
+        if self.args.skill_config is not None:
+            skill_config = self.args.skill_config.resolve()
+            if not skill_config.is_file():
+                raise FileNotFoundError(f"Skill config does not exist: {skill_config}")
+            return skill_config
+        audit_path = self.report_root / "libero_rlds_h16_audit.json"
+        if self.args.force_static_audits or not audit_path.is_file():
+            self.run(
+                "rlds_h16_audit",
+                self.python_command(
+                    "scripts/audit_flow_wam_rlds.py",
+                    "--data-root", self.args.data_root,
+                    "--skill-sidecar", self.args.skill_sidecar,
+                    "--max-horizon", 16,
+                    "--output", audit_path,
+                ),
+            )
+        if self.args.dry_run and not audit_path.is_file():
+            return self.report_root / "skill_experts_h16.json"
+        report = load_json(audit_path)
+        config = load_json(self.repo / "configs/mowe_wam/skill_experts.yaml")
+        counts: Counter[str] = Counter()
+        for suite in report["suites"]:
+            counts.update(suite["parsed_skill_counts"])
+        inverse = [1.0 / math.sqrt(max(int(counts[name]), 1)) for name in ALL_SKILLS]
+        scale = len(inverse) / sum(inverse)
+        config["source_path"] = str(self.args.skill_sidecar.resolve())
+        config["audit"].update(
+            {
+                "report": str(audit_path.resolve()),
+                "dataset_manifest_fingerprint_sha256": report["dataset_manifest_fingerprint_sha256"],
+                "sidecar_fingerprint_sha256": report["sidecar_fingerprint_sha256"],
+                "episodes": report["totals"]["episodes"],
+                "transitions": report["totals"]["transitions"],
+                "valid_windows_h16": report["totals"]["valid_windows"],
+                "exact_episode_key_matches": report["totals"]["exact_episode_key_matches"],
+                "annotation_step_match_ratio": report["totals"]["annotation_step_match_ratio"],
+                "alignment_verified": False,
+                "label_counts": {
+                    name: int(counts[name]) for name in (*ALL_SKILLS, "unknown")
+                },
+            }
+        )
+        config["class_weights_inverse_sqrt"] = [round(value * scale, 6) for value in inverse]
+        skill_config = self.report_root / "skill_experts_h16.json"
+        atomic_json(skill_config, config)
+        self.run(
+            "skill_config_inspect",
+            self.python_command(
+                "scripts/inspect_skill_experts.py",
+                "--data-root", self.args.data_root,
+                "--skill-config", skill_config,
+                "--sidecar", self.args.skill_sidecar,
+            ),
+        )
+        return skill_config
+
+    def ensure_static_evidence(self) -> Path:
+        skill_config = self.ensure_skill_config()
+        feature_report = self.report_root / "feature_store_audit.json"
+        if self.args.force_static_audits or not report_matches_store(
+            feature_report, self.args.feature_store, kind="feature"
+        ):
+            self.run(
+                "feature_store_audit",
+                self.python_command(
+                    "scripts/audit_mowe_feature_store.py",
+                    "--store", self.args.feature_store,
+                    "--world-size", self.args.world_size,
+                    "--seed", self.args.seed,
+                    "--shuffle-block-size", self.args.shuffle_block_size,
+                    "--verify-all-checksums",
+                    "--sample-windows", 32,
+                    "--max-window-imbalance-ratio", self.args.max_window_imbalance_ratio,
+                    "--max-suite-imbalance-ratio", self.args.max_suite_imbalance_ratio,
+                    "--max-skill-imbalance-ratio", self.args.max_skill_imbalance_ratio,
+                    "--output", feature_report,
+                ),
+            )
+        equivalence_report = self.report_root / "feature_equivalence_100.json"
+        evidence_inputs = self.state.get("static_evidence_inputs")
+        current_inputs = {
+            "store": str(self.args.feature_store.resolve()),
+            "data_root": str(self.args.data_root.resolve()),
+            "openvla_checkpoint": str(self.args.openvla_checkpoint.resolve()),
+            "openvla_revision": self.args.openvla_revision,
+            "dino_checkpoint": str(self.args.dino_checkpoint.resolve()),
+            "skill_sidecar": str(self.args.skill_sidecar.resolve()),
+            "samples": self.args.equivalence_samples,
+        }
+        if (
+            self.args.force_static_audits
+            or evidence_inputs != current_inputs
+            or not report_matches_store(
+                equivalence_report,
+                self.args.feature_store,
+                kind="equivalence",
+                samples=self.args.equivalence_samples,
+            )
+        ):
+            self.run(
+                "feature_equivalence",
+                self.python_command(
+                    "scripts/audit_feature_store_equivalence.py",
+                    "--config", "configs/mowe_wam/train_nominal_flow_wam.yaml",
+                    "--store", self.args.feature_store,
+                    "--data-root", self.args.data_root,
+                    "--checkpoint", self.args.openvla_checkpoint,
+                    "--backbone-revision", self.args.openvla_revision,
+                    "--teacher-checkpoint", self.args.dino_checkpoint,
+                    "--skill-sidecar", self.args.skill_sidecar,
+                    "--samples", self.args.equivalence_samples,
+                    "--seed", self.args.equivalence_seed,
+                    "--stage", "nominal_flow_pretrain",
+                    "--feature-atol", self.args.feature_atol,
+                    "--output-atol", self.args.output_atol,
+                    "--loss-atol", self.args.loss_atol,
+                    "--output", equivalence_report,
+                ),
+            )
+            self.state["static_evidence_inputs"] = current_inputs
+            self.save_state()
+        return skill_config
+
+    def ensure_node_evidence(self) -> None:
+        soak_report = self.report_root / "feature_store_soak_8rank.json"
+        if self.args.force_node_audits or not node_report_is_current(
+            soak_report,
+            world_size=self.args.world_size,
+            store=self.args.feature_store,
+                expected_limits=None if self.args.disable_system_monitoring else {
+                "max_anon_growth_mib": self.args.max_anon_growth_mib,
+                "max_working_set_growth_mib": self.args.max_working_set_growth_mib,
+                "max_anon_slope_mib_per_1k_steps": self.args.max_anon_slope_mib,
+                "max_working_set_slope_mib_per_1k_steps": self.args.max_working_set_slope_mib,
+            },
+        ):
+            self.run(
+                "feature_store_soak_8rank",
+                self.torchrun_command(
+                    "scripts/soak_mowe_feature_store.py",
+                    "--store", self.args.feature_store,
+                    "--steps", self.args.soak_steps,
+                    "--warmup-steps", self.args.soak_warmup_steps,
+                    "--sample-every", self.args.soak_sample_every,
+                    "--max-anon-growth-mib", self.args.max_anon_growth_mib,
+                    "--max-working-set-growth-mib", self.args.max_working_set_growth_mib,
+                    "--max-anon-slope-mib-per-1k-steps", self.args.max_anon_slope_mib,
+                    "--max-working-set-slope-mib-per-1k-steps", self.args.max_working_set_slope_mib,
+                    "--max-open-feature-shards", 2,
+                    "--shuffle-block-size", self.args.shuffle_block_size,
+                    *(
+                        ["--disable-system-monitoring"]
+                        if self.args.disable_system_monitoring else []
+                    ),
+                    "--output", soak_report,
+                ),
+            )
+        runtime_report = self.report_root / "ddp_runtime_8gpu.json"
+        if self.args.force_node_audits or not node_report_is_current(
+            runtime_report,
+            world_size=self.args.world_size,
+                expected_limits={
+                    "gpu_peak_allocated_fraction": self.args.gpu_memory_guard_fraction,
+                    **(
+                        {} if self.args.disable_system_monitoring else {
+                            "cgroup_working_set_fraction": self.args.memory_guard_fraction,
+                        }
+                    ),
+                },
+        ):
+            self.run(
+                "ddp_runtime_8gpu",
+                self.torchrun_command(
+                    "scripts/audit_ddp_runtime.py",
+                    "--config", self.runtime_configs["stage1"],
+                    "--memory-guard-fraction", self.args.memory_guard_fraction,
+                    "--gpu-memory-guard-fraction", self.args.gpu_memory_guard_fraction,
+                    *(
+                        ["--disable-system-monitoring"]
+                        if self.args.disable_system_monitoring else []
+                    ),
+                    "--output", runtime_report,
+                ),
+            )
+
+    def common_train_args(self, config: str, output_dir: Path, max_steps: int, stop_step: int) -> list[Any]:
+        return [
+            "--config", config,
+            "--feature-store", self.args.feature_store,
+            "--checkpoint", self.args.openvla_checkpoint,
+            "--backbone-revision", self.args.openvla_revision,
+            "--teacher-checkpoint", self.args.dino_checkpoint,
+            "--skill-expert-config", self.skill_config,
+            "--output-dir", output_dir,
+            "--max-steps", max_steps,
+            "--stop-step", stop_step,
+            "--grad-accumulation-steps", 1,
+            "--flow-solver-steps", self.args.flow_solver_steps,
+            "--precision", "bf16",
+        ]
+
+    def issue_readiness(
+        self, stage_name: str, config: str, checkpoint: Path, *, step_hint: int | None = None
+    ) -> Path:
+        metadata = checkpoint_metadata(checkpoint) or self.virtual_checkpoints.get(str(checkpoint))
+        if metadata is None:
+            if not self.args.dry_run or step_hint is None:
+                raise RuntimeError(f"Cannot issue readiness without a checkpoint: {checkpoint}")
+            step = int(step_hint)
+        else:
+            step = int(metadata["step"])
+        output = self.report_root / f"readiness_{stage_name}_step{step}.json"
+        self.run(
+            f"readiness_{stage_name}_step{step}",
+            self.python_command(
+                "scripts/audit_long_training_readiness.py",
+                "--config", config,
+                "--store", self.args.feature_store,
+                "--feature-audit", self.report_root / "feature_store_audit.json",
+                "--equivalence-report", self.report_root / "feature_equivalence_100.json",
+                "--soak-report", self.report_root / "feature_store_soak_8rank.json",
+                "--ddp-runtime-audit", self.report_root / "ddp_runtime_8gpu.json",
+                "--skill-expert-config", self.skill_config,
+                "--checkpoint", checkpoint,
+                "--checkpoint-mode", "resume",
+                "--world-size", self.args.world_size,
+                "--min-equivalence-samples", self.args.equivalence_samples,
+                "--min-soak-steps", self.args.soak_steps,
+                *(
+                    ["--allow-missing-cgroup-metrics"]
+                    if self.args.disable_system_monitoring else []
+                ),
+                "--output", output,
+            ),
+        )
+        return output
+
+    def run_training_segment(
+        self,
+        *,
+        task: str,
+        script: str,
+        config: str,
+        output_dir: Path,
+        max_steps: int,
+        stop_step: int,
+        save_freq: int,
+        log_freq: int,
+        expected_stage: str,
+        init_checkpoint: Path | None = None,
+        readiness: Path | None = None,
+        route_mode: str | None = None,
+    ) -> None:
+        checkpoint = output_dir / "checkpoint_latest.pt"
+        metadata = (
+            checkpoint_metadata(checkpoint, expected_stage)
+            if checkpoint.exists()
+            else self.virtual_checkpoints.get(str(checkpoint))
+        )
+        if metadata is not None and int(metadata["step"]) >= stop_step:
+            print(f"SKIP {task}: checkpoint already reached step {metadata['step']}", flush=True)
+            return
+        args = self.common_train_args(config, output_dir, max_steps, stop_step)
+        args += ["--save-freq", save_freq, "--log-freq", log_freq]
+        if route_mode is not None:
+            args += ["--route-mode", route_mode]
+        if metadata is not None:
+            args += ["--resume", checkpoint]
+        elif init_checkpoint is not None:
+            args += ["--init-wam", init_checkpoint]
+        if readiness is not None:
+            args += ["--long-run-readiness-report", readiness]
+        self.run(task, self.torchrun_command(script, *args))
+        if self.args.dry_run:
+            self.virtual_checkpoints[str(checkpoint)] = {
+                "format": "flow_wam_skill_components_v2",
+                "stage": expected_stage,
+                "step": stop_step,
+            }
+        if not self.args.dry_run:
+            completed = checkpoint_metadata(checkpoint, expected_stage)
+            if completed is None or int(completed["step"]) != stop_step:
+                raise RuntimeError(f"{task} did not produce expected step {stop_step}: {checkpoint}")
+
+    def validate_smoke(self, stage_dir: Path, stage: str) -> dict[str, Any]:
+        train = jsonl_rows(stage_dir / "train_log.jsonl")
+        validation = jsonl_rows(stage_dir / "validation_log.jsonl")
+        if not train or not validation or not finite_tree(train) or not finite_tree(validation):
+            raise RuntimeError(f"{stage} logs are missing or contain NaN/Inf.")
+        if sum(int(row.get("null_motion_zero_violation_count", 0)) for row in train):
+            raise RuntimeError(f"{stage} violates the null residual contract.")
+        max_residual = max(float(row.get("motion_residual_norm_max", 0.0)) for row in train)
+        if max_residual > 0.5001:
+            raise RuntimeError(f"{stage} residual norm exceeds 0.5: {max_residual}")
+        result = {
+            "stage": stage,
+            "last_step": train[-1].get("step"),
+            "max_residual_norm": max_residual,
+            "null_motion_zero_violation_count": 0,
+        }
+        if stage in {"stage2", "stage3"}:
+            maximums = [
+                max(float(row.get("motor_expert_gradient_norms", [0.0] * 6)[index]) for row in train)
+                for index in range(6)
+            ]
+            result["max_motor_expert_gradient_norms"] = maximums
+            if any(value <= 0 or not math.isfinite(value) for value in maximums):
+                raise RuntimeError(f"{stage} did not produce finite non-zero gradients for all motor experts: {maximums}")
+        if stage == "stage2" and {row.get("route_source") for row in train} != {"oracle"}:
+            raise RuntimeError("Stage 2 warm-start must remain oracle-routed.")
+        if stage == "stage3":
+            router = max(
+                float(row.get("component_gradient_norms", {}).get("router", 0.0))
+                for row in train
+            )
+            result["max_router_gradient_norm"] = router
+            if router <= 0 or not math.isfinite(router):
+                raise RuntimeError("Stage 3 router gradient is missing or non-finite.")
+        atomic_json(self.report_root / f"{stage}_smoke_gate.json", {"passed": True, **result})
+        return result
+
+    def validate_stage1_quality(self, stage_dir: Path) -> dict[str, Any]:
+        validation = jsonl_rows(stage_dir / "validation_log.jsonl")
+        train = jsonl_rows(stage_dir / "train_log.jsonl")
+        pilot_indices = [
+            index
+            for index, row in enumerate(validation)
+            if int(row.get("step", -1)) == self.args.stage1_pilot_step
+        ]
+        if not pilot_indices:
+            raise RuntimeError("Stage 1 pilot has no validation record at the promotion step.")
+        pilot_index = pilot_indices[-1]
+        pilot = validation[pilot_index]
+        horizons = pilot.get("future_horizon_metrics", {})
+        improvements = {}
+        for horizon in (4, 8, 16):
+            metrics = horizons.get(str(horizon), {})
+            predicted = float(metrics.get("smooth_l1", float("inf")))
+            copied = float(metrics.get("current_copy_smooth_l1", float("nan")))
+            improvements[str(horizon)] = (copied - predicted) / copied if copied > 0 else float("-inf")
+        average = sum(improvements.values()) / len(improvements)
+        recent_validation = [
+            float(row.get("metrics", {}).get("total_loss", float("nan")))
+            for row in validation[max(0, pilot_index - 2) : pilot_index + 1]
+        ]
+        three_worse = len(recent_validation) == 3 and all(
+            recent_validation[index] > recent_validation[index - 1] for index in (1, 2)
+        )
+        pilot_train = [
+            row for row in train if int(row.get("step", 0)) <= self.args.stage1_pilot_step
+        ]
+        recent_train = pilot_train[-min(len(pilot_train), 10):]
+        minimum_gate = min(float(row.get("action_distance_gate_mean", 0.0)) for row in recent_train)
+        view_ok = all(
+            len(row.get("current_view_weights_mean", [])) == 2
+            and abs(sum(float(value) for value in row["current_view_weights_mean"]) - 1.0) <= 1e-3
+            and max(float(value) for value in row["current_view_weights_mean"]) < 0.99
+            for row in recent_train
+        )
+        passed = (
+            all(value >= 0.0 for value in improvements.values())
+            and average >= self.args.stage1_min_copy_improvement
+            and not three_worse
+            and minimum_gate >= self.args.min_action_distance_gate
+            and view_ok
+        )
+        report = {
+            "format": "mowe_stage1_quality_gate_v1",
+            "passed": passed,
+            "validation_step": pilot.get("step"),
+            "fractional_improvement_over_copy_current": improvements,
+            "average_improvement": average,
+            "required_average_improvement": self.args.stage1_min_copy_improvement,
+            "last_three_validation_losses": recent_validation,
+            "three_consecutive_worsening": three_worse,
+            "minimum_recent_action_distance_gate": minimum_gate,
+            "view_weights_valid_and_not_collapsed": view_ok,
+        }
+        atomic_json(self.report_root / "stage1_quality_gate.json", report)
+        if not passed:
+            raise RuntimeError(
+                "Stage 1 quality gate failed at the pilot step; training stopped before the long run. "
+                f"See {self.report_root / 'stage1_quality_gate.json'}"
+            )
+        return report
+
+    def validate_stage2_quality(self, stage_dir: Path) -> dict[str, Any]:
+        train = jsonl_rows(stage_dir / "train_log.jsonl")
+        diagnostics = [
+            row.get("route_mode_diagnostics", {}).get("hard_predicted")
+            for row in train
+            if row.get("route_mode_diagnostics", {}).get("hard_predicted")
+        ]
+        route_accuracy = (
+            sum(float(item.get("route_accuracy", 0.0)) for item in diagnostics) / len(diagnostics)
+            if diagnostics else 0.0
+        )
+        sums = {name: {"count": 0, "nominal": 0.0, "final": 0.0} for name in MOTOR_SKILLS}
+        for row in train:
+            for name in MOTOR_SKILLS:
+                item = row.get("per_skill_diagnostics", {}).get(name, {})
+                count = int(item.get("count", 0))
+                if count:
+                    sums[name]["count"] += count
+                    sums[name]["nominal"] += count * float(item["nominal_endpoint_l1"])
+                    sums[name]["final"] += count * float(item["final_endpoint_l1"])
+        improved = []
+        for name, values in sums.items():
+            if values["count"] and values["final"] < values["nominal"]:
+                improved.append(name)
+        max_clip = max(float(row.get("motion_residual_clip_fraction", 0.0)) for row in train)
+        passed = (
+            route_accuracy >= self.args.stage2_min_hard_route_accuracy
+            and len(improved) >= self.args.stage2_min_improved_experts
+            and max_clip <= self.args.max_residual_clip_fraction
+        )
+        report = {
+            "format": "mowe_stage2_quality_gate_v1",
+            "passed": passed,
+            "hard_predicted_route_accuracy_mean": route_accuracy,
+            "required_route_accuracy": self.args.stage2_min_hard_route_accuracy,
+            "improved_motor_experts": improved,
+            "required_improved_motor_experts": self.args.stage2_min_improved_experts,
+            "max_residual_clip_fraction": max_clip,
+            "allowed_residual_clip_fraction": self.args.max_residual_clip_fraction,
+        }
+        atomic_json(self.report_root / "stage2_quality_gate.json", report)
+        if not passed:
+            raise RuntimeError(
+                "Stage 2 quality gate failed; Stage 3 was not started. See "
+                f"{self.report_root / 'stage2_quality_gate.json'}"
+            )
+        return report
+
+    def write_stage3_quality(self, stage_dir: Path) -> None:
+        train = jsonl_rows(stage_dir / "train_log.jsonl")
+        diagnostics = [
+            row.get("route_mode_diagnostics", {}).get("hard_predicted")
+            for row in train
+            if row.get("route_mode_diagnostics", {}).get("hard_predicted")
+        ]
+        route_accuracy = (
+            sum(float(item.get("route_accuracy", 0.0)) for item in diagnostics) / len(diagnostics)
+            if diagnostics else 0.0
+        )
+        boundary = [float(row["boundary_f1"]) for row in train if row.get("boundary_f1") is not None]
+        report = {
+            "format": "mowe_stage3_training_quality_summary_v1",
+            "training_complete": True,
+            "hard_predicted_route_accuracy_mean": route_accuracy,
+            "recommended_minimum_route_accuracy": self.args.stage3_min_hard_route_accuracy,
+            "boundary_f1_mean": sum(boundary) / len(boundary) if boundary else None,
+            "recommended_minimum_boundary_f1": self.args.stage3_min_boundary_f1,
+            "note": "Training diagnostics only; simulator success rate is still required.",
+        }
+        report["recommended_gates_passed"] = (
+            route_accuracy >= self.args.stage3_min_hard_route_accuracy
+            and report["boundary_f1_mean"] is not None
+            and report["boundary_f1_mean"] >= self.args.stage3_min_boundary_f1
+        )
+        atomic_json(self.report_root / "stage3_quality_summary.json", report)
+
+    def train_stage1(self) -> Path:
+        output = self.stage_root / "stage1"
+        checkpoint = output / "checkpoint_latest.pt"
+        metadata = (
+            checkpoint_metadata(checkpoint, "nominal_flow_pretrain")
+            if checkpoint.exists()
+            else self.virtual_checkpoints.get(str(checkpoint))
+        )
+        step = int(metadata["step"]) if metadata else 0
+        for target, save_freq, log_freq in ((2, 2, 1), (25, 25, 5), (100, 25, 5)):
+            if step < target:
+                self.run_training_segment(
+                    task=f"ddp_stage1_{step}_{target}",
+                    script="scripts/pretrain_nominal_flow_wam.py",
+                    config=self.runtime_configs["stage1"],
+                    output_dir=output,
+                    max_steps=self.args.stage1_max_steps,
+                    stop_step=target,
+                    save_freq=save_freq,
+                    log_freq=log_freq,
+                    expected_stage="nominal_flow_pretrain",
+                )
+                step = target
+        if not self.args.dry_run:
+            self.validate_smoke(output, "stage1")
+        if step < self.args.stage1_pilot_step:
+            readiness = self.issue_readiness(
+                "stage1", self.runtime_configs["stage1"], checkpoint, step_hint=step
+            )
+            self.run_training_segment(
+                task=f"ddp_stage1_{step}_{self.args.stage1_pilot_step}",
+                script="scripts/pretrain_nominal_flow_wam.py",
+                config=self.runtime_configs["stage1"],
+                output_dir=output,
+                max_steps=self.args.stage1_max_steps,
+                stop_step=self.args.stage1_pilot_step,
+                save_freq=100,
+                log_freq=10,
+                expected_stage="nominal_flow_pretrain",
+                readiness=readiness,
+            )
+            step = self.args.stage1_pilot_step
+        if not self.args.dry_run:
+            self.validate_stage1_quality(output)
+        if step < self.args.stage1_max_steps:
+            readiness = self.issue_readiness(
+                "stage1", self.runtime_configs["stage1"], checkpoint, step_hint=step
+            )
+            self.run_training_segment(
+                task=f"ddp_stage1_{step}_{self.args.stage1_max_steps}",
+                script="scripts/pretrain_nominal_flow_wam.py",
+                config=self.runtime_configs["stage1"],
+                output_dir=output,
+                max_steps=self.args.stage1_max_steps,
+                stop_step=self.args.stage1_max_steps,
+                save_freq=self.args.long_save_freq,
+                log_freq=self.args.long_log_freq,
+                expected_stage="nominal_flow_pretrain",
+                readiness=readiness,
+            )
+        return checkpoint
+
+    def train_stage2(self, predecessor: Path) -> Path:
+        output = self.stage_root / "stage2"
+        checkpoint = output / "checkpoint_latest.pt"
+        metadata = (
+            checkpoint_metadata(checkpoint, "expert_warmstart")
+            if checkpoint.exists()
+            else self.virtual_checkpoints.get(str(checkpoint))
+        )
+        step = int(metadata["step"]) if metadata else 0
+        if step < 100:
+            self.run_training_segment(
+                task=f"ddp_stage2_{step}_100",
+                script="scripts/warmstart_skill_flow_experts.py",
+                config=self.runtime_configs["stage2"],
+                output_dir=output,
+                max_steps=self.args.stage2_max_steps,
+                stop_step=100,
+                save_freq=25,
+                log_freq=5,
+                expected_stage="expert_warmstart",
+                init_checkpoint=predecessor,
+                route_mode="oracle",
+            )
+            step = 100
+        if not self.args.dry_run:
+            self.validate_smoke(output, "stage2")
+        if step < self.args.stage2_max_steps:
+            readiness = self.issue_readiness(
+                "stage2", self.runtime_configs["stage2"], checkpoint, step_hint=step
+            )
+            self.run_training_segment(
+                task=f"ddp_stage2_{step}_{self.args.stage2_max_steps}",
+                script="scripts/warmstart_skill_flow_experts.py",
+                config=self.runtime_configs["stage2"],
+                output_dir=output,
+                max_steps=self.args.stage2_max_steps,
+                stop_step=self.args.stage2_max_steps,
+                save_freq=self.args.long_save_freq,
+                log_freq=self.args.long_log_freq,
+                expected_stage="expert_warmstart",
+                readiness=readiness,
+                route_mode="oracle",
+            )
+        if not self.args.dry_run:
+            self.validate_stage2_quality(output)
+        return checkpoint
+
+    def train_stage3(self, predecessor: Path) -> Path:
+        output = self.stage_root / "stage3"
+        checkpoint = output / "checkpoint_latest.pt"
+        metadata = (
+            checkpoint_metadata(checkpoint, "joint")
+            if checkpoint.exists()
+            else self.virtual_checkpoints.get(str(checkpoint))
+        )
+        step = int(metadata["step"]) if metadata else 0
+        if step < 100:
+            self.run_training_segment(
+                task=f"ddp_stage3_{step}_100",
+                script="scripts/train_flow_wam_skill_moe.py",
+                config=self.runtime_configs["stage3"],
+                output_dir=output,
+                max_steps=self.args.stage3_max_steps,
+                stop_step=100,
+                save_freq=25,
+                log_freq=5,
+                expected_stage="joint",
+                init_checkpoint=predecessor,
+            )
+            step = 100
+        if not self.args.dry_run:
+            self.validate_smoke(output, "stage3")
+        if step < self.args.stage3_max_steps:
+            readiness = self.issue_readiness(
+                "stage3", self.runtime_configs["stage3"], checkpoint, step_hint=step
+            )
+            self.run_training_segment(
+                task=f"ddp_stage3_{step}_{self.args.stage3_max_steps}",
+                script="scripts/train_flow_wam_skill_moe.py",
+                config=self.runtime_configs["stage3"],
+                output_dir=output,
+                max_steps=self.args.stage3_max_steps,
+                stop_step=self.args.stage3_max_steps,
+                save_freq=self.args.long_save_freq,
+                log_freq=self.args.long_log_freq,
+                expected_stage="joint",
+                readiness=readiness,
+            )
+        if not self.args.dry_run:
+            self.write_stage3_quality(output)
+        return checkpoint
+
+    def execute(self) -> None:
+        self.preflight()
+        self.skill_config = self.ensure_static_evidence()
+        self.ensure_node_evidence()
+        stage1 = self.train_stage1()
+        stage2 = self.train_stage2(stage1)
+        stage3 = self.train_stage3(stage2)
+        self.record(
+            "pipeline",
+            status="dry_run" if self.args.dry_run else "complete",
+            completed_at=utc_now(),
+            final_checkpoint=str(stage3),
+        )
+        print(f"\nMoWE training pipeline complete. Final checkpoint: {stage3}", flush=True)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="一键完成 MoWE 正式 8 卡审计、readiness 与 Stage 1/2/3 训练。",
+    )
+
+    # 代码仓库根目录：换服务器后通常需要修改。
+    parser.add_argument("--repo-root", type=Path, default=SCRIPT_ROOT, help="MoWE 仓库根目录。")
+    # 原始 LIBERO RLDS 根目录：用于重新生成跨服务器有效的 100-window 等价性证据。
+    parser.add_argument("--data-root", type=Path, required=True, help="LIBERO RLDS 数据根目录。")
+    # 已完成且 formal_training_ready=true 的 feature store；可挂载到不同绝对路径。
+    parser.add_argument("--feature-store", type=Path, required=True, help="正式 mowe feature store 目录。")
+    # 原始 openvla/openvla-7b 本地 snapshot；不得使用 LIBERO-finetuned 权重。
+    parser.add_argument("--openvla-checkpoint", type=Path, required=True, help="原始 OpenVLA-7B snapshot。")
+    # OpenVLA 的不可变 40 位 Hugging Face commit。
+    parser.add_argument("--openvla-revision", required=True, help="OpenVLA 40 位 commit revision。")
+    # DINOv2 teacher snapshot；等价性审计会用它重新编码真实窗口。
+    parser.add_argument("--dino-checkpoint", type=Path, required=True, help="DINOv2-small snapshot。")
+    # CoT skill sidecar JSON；必须与 feature store manifest 中的 fingerprint 对应。
+    parser.add_argument("--skill-sidecar", type=Path, required=True, help="cot_file.json 路径。")
+    # 可选的已审计 skill config；不传则自动运行 RLDS audit 并生成。
+    parser.add_argument("--skill-config", type=Path, help="可选 skill_experts_h16.json；默认自动生成。")
+
+    # MTP 输出根目录；兼容旧平台参数名 --run_root_dir。
+    parser.add_argument("--run-root-dir", "--run_root_dir", type=Path, required=True, help="所有实验输出的父目录。")
+    # 本次正式 lineage 的唯一 ID；兼容旧平台参数名 --run_id。
+    parser.add_argument("--run-id", "--run_id", required=True, help="实验/lineage 名称，建议包含日期与模型版本。")
+    # 报告目录；默认 <run-root-dir>/<run-id>/reports。
+    parser.add_argument("--report-root", type=Path, help="审计、readiness 和启动日志目录。")
+    # Stage checkpoint 目录；默认 <run-root-dir>/<run-id>/ddp8。
+    parser.add_argument("--stage-root", type=Path, help="Stage 1/2/3 checkpoint 根目录。")
+    # 可选 Python 解释器；默认使用启动 start_mtp.py 的解释器。
+    parser.add_argument("--python", type=Path, help="目标训练环境的 python 可执行文件。")
+
+    # 正式合同固定 8 rank；保留参数便于平台显式展示，但不允许改成其他值。
+    parser.add_argument("--world-size", type=int, default=8, help="正式 DDP world size，必须为 8。")
+    # 逗号分隔的可见 GPU ID；数量必须等于 world size。
+    parser.add_argument("--cuda-devices", default="0,1,2,3,4,5,6,7", help="CUDA_VISIBLE_DEVICES。")
+    # 数据分配与训练的全局随机种子。
+    parser.add_argument("--seed", type=int, default=7, help="feature assignment seed。")
+    # shard-aware sampler 的 block size，必须与正式训练配置一致。
+    parser.add_argument("--shuffle-block-size", type=int, default=256, help="sampler shuffle block size。")
+
+    # 三个正式训练配置；路径相对于 repo-root。
+    parser.add_argument("--stage1-config", default="configs/mowe_wam/ddp8_nominal_flow_wam_feature_store_formal.yaml", help="Stage 1 配置。")
+    parser.add_argument("--stage2-config", default="configs/mowe_wam/ddp8_warmstart_skill_flow_feature_store.yaml", help="Stage 2 配置。")
+    parser.add_argument("--stage3-config", default="configs/mowe_wam/ddp8_train_flow_wam_feature_store.yaml", help="Stage 3 配置。")
+    # 三阶段完整 optimizer step 数；修改会改变实验合同。
+    parser.add_argument("--stage1-max-steps", type=int, default=50000, help="Stage 1 总步数。")
+    parser.add_argument("--stage2-max-steps", type=int, default=50000, help="Stage 2 总步数。")
+    parser.add_argument("--stage3-max-steps", type=int, default=30000, help="Stage 3 总步数。")
+    # Stage 1 在该 step 做 copy-current promotion gate。
+    parser.add_argument("--stage1-pilot-step", type=int, default=1000, help="Stage 1 质量门槛 step。")
+    # Flow ODE solver steps；须与单卡验证和正式配置一致。
+    parser.add_argument("--flow-solver-steps", type=int, default=4, help="Flow solver steps。")
+    # 长训练 checkpoint/日志频率；中断恢复会使用最近 checkpoint。
+    parser.add_argument("--long-save-freq", type=int, default=500, help="长训练 checkpoint 周期。")
+    parser.add_argument("--long-log-freq", type=int, default=10, help="长训练日志周期。")
+
+    # 100-window raw/cache 等价性参数；不建议放宽默认容差。
+    parser.add_argument("--equivalence-samples", type=int, default=100, help="等价性窗口数，正式至少 100。")
+    parser.add_argument("--equivalence-seed", type=int, default=1701, help="等价性抽样 seed。")
+    parser.add_argument("--feature-atol", type=float, default=0.03, help="feature gate 容差。")
+    parser.add_argument("--output-atol", type=float, default=0.10, help="model output 容差。")
+    parser.add_argument("--loss-atol", type=float, default=0.05, help="loss 容差。")
+    # 8-rank 数据均衡上限；真实 audit 失败时不要仅为通过而放宽。
+    parser.add_argument("--max-window-imbalance-ratio", type=float, default=1.25, help="window imbalance 上限。")
+    parser.add_argument("--max-suite-imbalance-ratio", type=float, default=1.50, help="suite imbalance 上限。")
+    parser.add_argument("--max-skill-imbalance-ratio", type=float, default=2.00, help="skill imbalance 上限。")
+
+    # 8-rank continuous soak 参数。
+    parser.add_argument("--soak-steps", type=int, default=10000, help="每 rank soak 读取步数。")
+    parser.add_argument("--soak-warmup-steps", type=int, default=1000, help="soak warmup 步数。")
+    parser.add_argument("--soak-sample-every", type=int, default=250, help="cgroup 采样间隔。")
+    parser.add_argument("--max-anon-growth-mib", type=float, default=512.0, help="匿名内存增长上限 MiB。")
+    parser.add_argument("--max-working-set-growth-mib", type=float, default=2048.0, help="working-set 增长上限 MiB。")
+    parser.add_argument("--max-anon-slope-mib", type=float, default=64.0, help="每千步 anon 斜率上限。")
+    parser.add_argument("--max-working-set-slope-mib", type=float, default=256.0, help="每千步 working-set 斜率上限。")
+    # 正式启动资源占用硬门槛。
+    parser.add_argument("--memory-guard-fraction", type=float, default=0.80, help="cgroup working-set 比例上限。")
+    parser.add_argument("--gpu-memory-guard-fraction", type=float, default=0.85, help="GPU peak 比例上限。")
+    # 无系统权限平台的显式降级模式：不读取 /proc、cgroup 或宿主机内存/OOM 指标。
+    parser.add_argument(
+        "--disable-system-monitoring",
+        "--disable-cgroup-monitoring",
+        action="store_true",
+        dest="disable_system_monitoring",
+        help="关闭所有 /proc/cgroup/宿主机资源检查；保留 CUDA/NCCL/GPU 显存检查。",
+    )
+
+    # Stage 1 promotion：H=4/8/16 都须优于 copy-current，且平均至少改善该比例。
+    parser.add_argument("--stage1-min-copy-improvement", type=float, default=0.10, help="Stage 1 相对 copy-current 平均改善。")
+    parser.add_argument("--min-action-distance-gate", type=float, default=0.05, help="action-distance gate 最低允许值。")
+    # Stage 2 promotion：进入 Stage 3 前的建议质量门槛。
+    parser.add_argument("--stage2-min-hard-route-accuracy", type=float, default=0.60, help="Stage 2 hard route accuracy。")
+    parser.add_argument("--stage2-min-improved-experts", type=int, default=5, help="final endpoint 优于 nominal 的 expert 数。")
+    parser.add_argument("--max-residual-clip-fraction", type=float, default=0.05, help="residual clip fraction 上限。")
+    # Stage 3 完成后只生成训练质量总结；最终模型仍需 simulator 评测。
+    parser.add_argument("--stage3-min-hard-route-accuracy", type=float, default=0.65, help="Stage 3 推荐 route accuracy。")
+    parser.add_argument("--stage3-min-boundary-f1", type=float, default=0.50, help="Stage 3 推荐 boundary F1。")
+
+    # 强制重做与数据/store 相关的静态审计。
+    parser.add_argument("--force-static-audits", action="store_true", help="强制重跑 RLDS/feature/equivalence 审计。")
+    # 强制重做与当前 node/boot/cgroup 绑定的 soak/runtime 审计。
+    parser.add_argument("--force-node-audits", action="store_true", help="强制重跑 soak 与 8-GPU runtime audit。")
+    # 只打印完整命令和写 dry-run 状态，不启动审计或训练；可在单卡机器检查参数。
+    parser.add_argument("--dry-run", action="store_true", help="仅验证路径并打印计划，不要求 8 张 GPU。")
+
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"Warning: ignored platform-injected arguments: {unknown}", file=sys.stderr)
+    for name in (
+        "data_root",
+        "feature_store",
+        "openvla_checkpoint",
+        "dino_checkpoint",
+        "skill_sidecar",
+        "run_root_dir",
+        "report_root",
+        "stage_root",
+        "skill_config",
+        "python",
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            setattr(args, name, value.expanduser())
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+    print(json.dumps({"argv": sys.argv, "started_at": utc_now()}, ensure_ascii=False), flush=True)
+    Launcher(args).execute()
+
+
+if __name__ == "__main__":
+    main()

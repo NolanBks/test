@@ -1,0 +1,9 @@
+{
+  "variant": "task_id_moe",
+  "router": {
+    "enabled": true,
+    "inputs": ["task_id"],
+    "use_oracle_predicates": false
+  },
+  "notes": "Router uses task or suite identity only."
+}

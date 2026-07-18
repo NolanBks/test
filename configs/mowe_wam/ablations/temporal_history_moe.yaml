@@ -1,0 +1,10 @@
+{
+  "variant": "temporal_history_moe",
+  "router": {
+    "enabled": true,
+    "inputs": ["features", "history_actions", "history_predicates"],
+    "use_future_prediction": false,
+    "use_event_memory": false
+  },
+  "notes": "History-only control for separating temporal context from future prediction."
+}

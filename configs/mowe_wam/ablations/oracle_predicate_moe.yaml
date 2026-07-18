@@ -1,0 +1,9 @@
+{
+  "variant": "oracle_predicate_moe",
+  "router": {
+    "enabled": true,
+    "inputs": ["features", "oracle_offline_predicates"],
+    "use_oracle_predicates": true
+  },
+  "notes": "Analysis-only upper bound. Non-deployable because it uses offline labels."
+}

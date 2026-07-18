@@ -1,0 +1,31 @@
+{
+  "base_config": "flow_wam_base.yaml",
+  "stage": "expert_warmstart",
+  "output_dir": "outputs/train/skill_flow_expert_warmstart",
+  "training": {
+    "device": "auto",
+    "precision": "bf16",
+    "batch_size": 1,
+    "grad_accumulation_steps": 8,
+    "max_steps": 50000,
+    "learning_rates": {"view_fusion": 0.00001, "memory_encoder": 0.00001, "world_model": 0.00001, "router": 0.0001, "residual_experts": 0.0001, "expert_context": 0.0001},
+    "weight_decay": 0.01,
+    "adam_betas": [0.9, 0.95],
+    "warmup_ratio": 0.04,
+    "min_lr_ratio": 0.10,
+    "max_grad_norm": 1.0,
+    "save_freq": 500,
+    "log_freq": 10
+  },
+  "loss_weights": {
+    "flow_nominal": 0.0,
+    "flow_expert": 1.0,
+    "gripper_bce": 0.0,
+    "route": 1.0,
+    "world": 1.0,
+    "delta": 0.5,
+    "load_balance": 0.0,
+    "residual": 0.001,
+    "endpoint": 0.0
+  }
+}

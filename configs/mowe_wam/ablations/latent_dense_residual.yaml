@@ -1,0 +1,4 @@
+{
+  "base_config": "../train_predictive_residual_moe.yaml",
+  "ablation": {"name": "latent_dense_residual", "force_dense_routing": true}
+}

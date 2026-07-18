@@ -1,0 +1,39 @@
+{
+  "base_config": "train_nominal_flow_wam.yaml",
+  "output_dir": "outputs/train/stage1_extended_1000_ddp8",
+  "teacher": {
+    "checkpoint": "/hy-tmp/facebook-dinov2-small",
+    "cache_path": "/hy-tmp/mowe_dino_cache_v2_complete"
+  },
+  "training": {
+    "device": "auto",
+    "precision": "bf16",
+    "batch_size": 1,
+    "grad_accumulation_steps": 1,
+    "max_steps": 1000,
+    "save_freq": 25,
+    "log_freq": 5,
+    "distributed": {
+      "enabled": "auto",
+      "backend": "nccl",
+      "timeout_seconds": 1800,
+      "broadcast_buffers": false,
+      "find_unused_parameters": false,
+      "memory_guard_fraction": 0.80
+    }
+  },
+  "data": {
+    "num_workers": 0,
+    "tf_frame_parallel_calls": 2,
+    "window_shuffle_buffer_size": 8,
+    "pin_memory": false
+  },
+  "validation": {
+    "enabled": true,
+    "eval_freq": 25,
+    "num_batches": 8,
+    "windows_per_episode": 1,
+    "seed": 1701,
+    "run_at_start": false
+  }
+}

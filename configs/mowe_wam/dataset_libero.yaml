@@ -1,0 +1,11 @@
+{
+  "dataset_root": "TBD",
+  "split": "train",
+  "format": "OpenVLA_OFT_RLDS_baseline_or_trajectory_window_for_predictive_variant",
+  "mock_label_path": "outputs/mock_predicates/mock_labels.jsonl",
+  "transition_label_path": "TBD",
+  "strict_episode_id": true,
+  "history_steps": 4,
+  "prediction_horizon": 8,
+  "predictive_requires_ordered_episode_labels": true
+}

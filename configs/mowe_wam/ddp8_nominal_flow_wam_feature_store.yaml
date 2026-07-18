@@ -1,0 +1,54 @@
+{
+  "base_config": "ddp8_nominal_flow_wam.yaml",
+  "output_dir": "outputs/train/stage1_extended_1000_ddp8_feature_store",
+  "backbone": {
+    "mode": "precomputed_features",
+    "feature_source": "pre_action_context_cache",
+    "freeze_backbone": true,
+    "dtype": "bf16",
+    "num_images_in_input": 2
+  },
+  "teacher": {
+    "cache_path": null,
+    "inference_enabled": false
+  },
+  "data": {
+    "backend": "mowe_feature_store_v1",
+    "data_root": null,
+    "feature_store_path": "TBD/mowe_features_v1",
+    "skill_sidecar_path": null,
+    "image_aug": false,
+    "num_workers": 0,
+    "tf_frame_parallel_calls": null,
+    "pin_memory": false,
+    "persistent_workers": false,
+    "prefetch_factor": null,
+    "max_open_feature_shards": 2,
+    "sampler_shuffle_block_size": 256,
+    "verify_feature_store_metadata_checksums": true,
+    "window_shuffle_buffer_size": 0
+  },
+  "long_run_readiness": {
+    "max_unattested_steps": 100,
+    "report_path": null
+  },
+  "training": {
+    "precision": "bf16",
+    "batch_size": 1,
+    "grad_accumulation_steps": 1,
+    "max_steps": 1000,
+    "save_freq": 100,
+    "log_freq": 10,
+    "warmup_ratio": 0.04,
+    "min_lr_ratio": 0.10,
+    "max_grad_norm": 1.0
+  },
+  "validation": {
+    "enabled": true,
+    "eval_freq": 100,
+    "num_batches": 32,
+    "windows_per_episode": 1,
+    "seed": 1701,
+    "run_at_start": false
+  }
+}

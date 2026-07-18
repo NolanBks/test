@@ -1,0 +1,17 @@
+{
+  "model": {
+    "variant": "baseline",
+    "hidden_dim": 1024,
+    "action_dim": 7,
+    "chunk_size": 8,
+    "num_experts": 5,
+    "top_k": 2,
+    "hidden_layers": [512],
+    "history_steps": 4,
+    "prediction_horizon": 8
+  },
+  "router": {
+    "inputs": ["features", "world_predicted_predicates"],
+    "use_oracle_predicates": false
+  }
+}

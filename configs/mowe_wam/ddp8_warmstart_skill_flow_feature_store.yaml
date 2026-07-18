@@ -1,0 +1,48 @@
+{
+  "base_config": "warmstart_skill_flow_experts.yaml",
+  "output_dir": "outputs/train/skill_flow_expert_warmstart_ddp8_feature_store",
+  "backbone": {
+    "mode": "precomputed_features",
+    "feature_source": "pre_action_context_cache",
+    "freeze_backbone": true,
+    "dtype": "bf16",
+    "num_images_in_input": 2
+  },
+  "teacher": {"checkpoint": "TBD", "cache_path": null, "inference_enabled": false},
+  "data": {
+    "backend": "mowe_feature_store_v1",
+    "data_root": null,
+    "feature_store_path": "TBD/mowe_features_v1",
+    "skill_sidecar_path": null,
+    "image_aug": false,
+    "num_workers": 0,
+    "tf_frame_parallel_calls": null,
+    "pin_memory": false,
+    "persistent_workers": false,
+    "prefetch_factor": null,
+    "max_open_feature_shards": 2,
+    "sampler_shuffle_block_size": 256,
+    "verify_feature_store_metadata_checksums": true,
+    "window_shuffle_buffer_size": 0
+  },
+  "long_run_readiness": {
+    "max_unattested_steps": 100,
+    "report_path": null
+  },
+  "training": {
+    "precision": "bf16",
+    "batch_size": 1,
+    "grad_accumulation_steps": 1,
+    "max_steps": 50000,
+    "save_freq": 500,
+    "log_freq": 10,
+    "distributed": {
+      "enabled": "auto",
+      "backend": "nccl",
+      "timeout_seconds": 1800,
+      "broadcast_buffers": false,
+      "find_unused_parameters": false,
+      "memory_guard_fraction": 0.80
+    }
+  }
+}

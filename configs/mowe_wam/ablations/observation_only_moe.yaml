@@ -1,0 +1,9 @@
+{
+  "variant": "observation_only_moe",
+  "router": {
+    "enabled": true,
+    "inputs": ["features"],
+    "use_oracle_predicates": false
+  },
+  "notes": "Router uses current backbone features and no predicate input."
+}

@@ -1,0 +1,62 @@
+{
+  "seed": 7,
+  "output_dir": "outputs/train/mowe_wam_libero_spatial",
+  "resume": null,
+  "backbone": {
+    "vla_path": "openvla/openvla-7b",
+    "checkpoint": null,
+    "openvla_root": "external/openvla-oft",
+    "device": "auto",
+    "dtype": "bf16",
+    "freeze_backbone": true,
+    "feature_source": "last_action_hidden",
+    "use_l1_regression": true,
+    "use_proprio": false,
+    "proprio_checkpoint": null,
+    "proprio_dim": 8,
+    "train_proprio_projector": false,
+    "num_images_in_input": 1
+  },
+  "data": {
+    "data_root": "TBD",
+    "dataset_name": "libero_spatial_no_noops",
+    "split": "train",
+    "batch_size": 1,
+    "shuffle_buffer_size": 100000,
+    "image_aug": true,
+    "num_workers": 0,
+    "pin_memory": true,
+    "limit_batches": null
+  },
+  "model": {
+    "hidden_dim": null,
+    "action_dim": 7,
+    "chunk_size": 8,
+    "num_experts": 5,
+    "top_k": 2,
+    "hidden_layers": [512],
+    "use_oracle_predicates": false
+  },
+  "training": {
+    "device": "auto",
+    "precision": "bf16",
+    "batch_size": 1,
+    "grad_accumulation_steps": 8,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.0,
+    "max_grad_norm": 1.0,
+    "max_steps": 1000,
+    "save_freq": 100,
+    "log_freq": 10,
+    "lr_decay_steps": [],
+    "lr_decay_gamma": 0.1
+  },
+  "loss_weights": {
+    "action": 1.0,
+    "predicate": 0.1,
+    "progress": 0.05,
+    "risk": 0.05,
+    "load_balance": 0.01,
+    "temporal_smoothness": 0.0
+  }
+}

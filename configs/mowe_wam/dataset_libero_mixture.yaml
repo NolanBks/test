@@ -1,0 +1,23 @@
+{
+  "data_root": "datasets/modified_libero_rlds",
+  "dataset_names": [
+    "libero_spatial_no_noops",
+    "libero_object_no_noops",
+    "libero_goal_no_noops",
+    "libero_10_no_noops"
+  ],
+  "split": "train",
+  "history_length": 8,
+  "long_memory_slots": 4,
+  "future_horizons": [1, 4, 8, 16],
+  "observation_views": ["primary", "wrist"],
+  "action_dim": 7,
+  "action_chunk_size": 16,
+  "joint_action_normalization": true,
+  "image_aug": false,
+  "use_proprio": false,
+  "num_workers": 0,
+  "window_shuffle_buffer_size": 8,
+  "pin_memory": true,
+  "limit_batches": null
+}

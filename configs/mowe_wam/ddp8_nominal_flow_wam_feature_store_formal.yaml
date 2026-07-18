@@ -1,0 +1,21 @@
+{
+  "base_config": "ddp8_nominal_flow_wam_feature_store.yaml",
+  "output_dir": "outputs/train/stage1_formal_50000_ddp8_feature_store",
+  "teacher": {"checkpoint": "TBD", "cache_path": null, "inference_enabled": false},
+  "training": {
+    "max_steps": 50000,
+    "save_freq": 500,
+    "log_freq": 10,
+    "warmup_ratio": 0.04,
+    "min_lr_ratio": 0.10,
+    "max_grad_norm": 1.0
+  },
+  "validation": {
+    "enabled": true,
+    "eval_freq": 500,
+    "num_batches": 32,
+    "windows_per_episode": 1,
+    "seed": 1701,
+    "run_at_start": false
+  }
+}

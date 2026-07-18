@@ -1,0 +1,43 @@
+{
+  "format": "mowe_skill_experts_v1",
+  "label_version": "cot_final_directive_leading_verb_v1",
+  "source_path": "datasets/libero_cot_rlds/cot_file.json",
+  "assume_sidecar_timestep_aligned": true,
+  "join_key": "traj_metadata.episode_metadata.file_path+global_trajectory_index+timestep",
+  "shuffle_files_before_join": false,
+  "num_parallel_reads": 16,
+  "boundary_label_policy": "direct_per_timestep_no_extra_mask",
+  "unknown_label": -1,
+  "null_route": 6,
+  "skills": {
+    "pick_grasp": 0,
+    "place_release": 1,
+    "move_transport": 2,
+    "open_close": 3,
+    "turn_rotate": 4,
+    "push_pull": 5,
+    "null_finish": 6
+  },
+  "audit": {
+    "report": "outputs/preflight/flow_wam_rlds_all_suites_audit.json",
+    "dataset_manifest_fingerprint_sha256": "9a76a53431a31580aa0022609f07666f385f070728ce672b7b8051f5c109150b",
+    "sidecar_fingerprint_sha256": "d35ec840a39a984951b83124740bb8fb50a1e5c43988323c69bc62497600a206",
+    "episodes": 1693,
+    "transitions": 273465,
+    "valid_windows_h16": 246377,
+    "exact_episode_key_matches": 1693,
+    "annotation_step_match_ratio": 1.0,
+    "alignment_verified": false,
+    "label_counts": {
+      "pick_grasp": 81137,
+      "place_release": 92320,
+      "move_transport": 30112,
+      "open_close": 8974,
+      "turn_rotate": 5395,
+      "push_pull": 4262,
+      "null_finish": 49276,
+      "unknown": 1989
+    }
+  },
+  "class_weights_inverse_sqrt": [0.4345, 0.4073, 0.7132, 1.3065, 1.6850, 1.8958, 0.5576]
+}

@@ -1,0 +1,9 @@
+{
+  "checkpoint": "TBD",
+  "dataset_root": "TBD",
+  "task_suite_name": "LIBERO-Plus-or-LIBERO-X-TBD",
+  "num_episodes": 1,
+  "max_tasks": 1,
+  "output_dir": "outputs/eval/libero_plus_subset",
+  "status": "TBD_until_benchmark_repo_and_perturbation_subset_are_attached"
+}

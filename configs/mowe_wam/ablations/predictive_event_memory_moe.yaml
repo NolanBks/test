@@ -1,0 +1,10 @@
+{
+  "variant": "predictive_event_memory_moe",
+  "router": {
+    "enabled": true,
+    "inputs": ["features", "future_predicates", "progress_delta", "future_risk", "future_recovery", "event_memory", "previous_expert"],
+    "use_future_prediction": true,
+    "use_event_memory": true
+  },
+  "notes": "Main deployable predictive-routing method with minimal structured event memory."
+}

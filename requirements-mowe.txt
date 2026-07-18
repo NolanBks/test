@@ -1,0 +1,14 @@
+# Lightweight MoWE-WAM local additions.
+# Install the full OpenVLA-OFT environment from external/openvla-oft/SETUP.md first.
+torch
+transformers
+accelerate
+tensorflow-datasets
+Pillow
+numpy
+pyyaml
+
+# Offline canonical-archive conversion only. These are not imported by the
+# feature-store training hot path.
+pyarrow>=16
+imageio-ffmpeg>=0.5

@@ -1,0 +1,85 @@
+{
+  "base_config": "train_nominal_flow_wam.yaml",
+  "stage": "nominal_flow_pretrain",
+  "output_dir": "outputs/train/calvin_abc/stage1_nominal_flow_ddp8",
+  "benchmark_contract": {
+    "name": "calvin",
+    "setting": "ABC-D",
+    "training_split": "task_ABC_D/training language segments only",
+    "evaluation_environment": "D",
+    "official_repo_commit": "fa03f01f19c65920e18cf37398a9ce859274af76"
+  },
+  "backbone": {
+    "mode": "precomputed_features",
+    "feature_source": "pre_action_context_cache",
+    "checkpoint": "TBD",
+    "freeze_backbone": true,
+    "dtype": "bf16",
+    "num_images_in_input": 2
+  },
+  "teacher": {
+    "checkpoint": "TBD",
+    "cache_path": null,
+    "inference_enabled": false
+  },
+  "data": {
+    "backend": "mowe_feature_store_v1",
+    "data_root": null,
+    "feature_store_path": "TBD/calvin_abc_features_v1",
+    "dataset_names": ["calvin_abc_language_segments"],
+    "skill_sidecar_path": null,
+    "image_aug": false,
+    "num_workers": 0,
+    "tf_frame_parallel_calls": null,
+    "pin_memory": false,
+    "persistent_workers": false,
+    "prefetch_factor": null,
+    "max_open_feature_shards": 2,
+    "sampler_shuffle_block_size": 256,
+    "verify_feature_store_metadata_checksums": true,
+    "window_shuffle_buffer_size": 0,
+    "validation_fraction": 0.05,
+    "split_seed": 1701
+  },
+  "skill_expert_config": "TBD/calvin_skill_experts.json",
+  "long_run_readiness": {
+    "max_unattested_steps": 100,
+    "report_path": null
+  },
+  "training": {
+    "device": "auto",
+    "precision": "bf16",
+    "batch_size": 1,
+    "grad_accumulation_steps": 1,
+    "max_steps": 20000,
+    "learning_rates": {
+      "view_fusion": 0.0001,
+      "memory_encoder": 0.0001,
+      "nominal_flow": 0.0001,
+      "gripper_head": 0.0001,
+      "world_model": 0.0001
+    },
+    "warmup_ratio": 0.05,
+    "min_lr_ratio": 0.10,
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
+    "save_freq": 500,
+    "log_freq": 10,
+    "distributed": {
+      "enabled": "auto",
+      "backend": "nccl",
+      "timeout_seconds": 1800,
+      "broadcast_buffers": false,
+      "find_unused_parameters": false,
+      "memory_guard_fraction": 0.80
+    }
+  },
+  "validation": {
+    "enabled": true,
+    "eval_freq": 500,
+    "num_batches": 32,
+    "windows_per_episode": 1,
+    "seed": 2701,
+    "run_at_start": false
+  }
+}

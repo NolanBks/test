@@ -1,0 +1,150 @@
+{
+  "seed": 7,
+  "model": {"variant": "flow_wam_skill_moe"},
+  "backbone": {
+    "mode": "online_openvla",
+    "vla_path": "openvla/openvla-7b",
+    "checkpoint": "TBD",
+    "repo_id": "openvla/openvla-7b",
+    "revision": "TBD",
+    "identity": null,
+    "require_original_backbone": true,
+    "openvla_root": "external/openvla-oft",
+    "dtype": "bf16",
+    "freeze_backbone": true,
+    "feature_source": "pre_action_context",
+    "use_proprio": false,
+    "num_images_in_input": 2,
+    "language_cache_size": 1024,
+    "visual_cache_size": 8192
+  },
+  "teacher": {
+    "checkpoint": "facebook/dinov2-small",
+    "dtype": "bf16",
+    "spatial_grid": 4,
+    "spatial_tokens": 16,
+    "target_dim": 384,
+    "target_views": ["primary"],
+    "inference_enabled": false,
+    "cache_path": null
+  },
+  "data": {
+    "backend": "rlds",
+    "data_root": "datasets/modified_libero_rlds",
+    "dataset_names": ["libero_spatial_no_noops", "libero_object_no_noops", "libero_goal_no_noops", "libero_10_no_noops"],
+    "split": "train",
+    "history_length": 8,
+    "long_memory_slots": 4,
+    "future_horizons": [1, 4, 8, 16],
+    "action_dim": 7,
+    "motion_dim": 6,
+    "gripper_dim": 1,
+    "action_chunk_size": 16,
+    "observation_views": ["primary", "wrist"],
+    "joint_action_normalization": true,
+    "image_aug": false,
+    "use_proprio": false,
+    "num_workers": 0,
+    "tf_frame_parallel_calls": 2,
+    "window_shuffle_buffer_size": 8,
+    "pin_memory": true,
+    "limit_batches": null,
+    "validation_fraction": 0.05,
+    "split_seed": 17,
+    "skill_sidecar_path": "datasets/libero_cot_rlds/cot_file.json",
+    "assume_sidecar_timestep_aligned": true,
+    "boundary_label_policy": "direct_per_timestep_no_extra_mask"
+  },
+  "view_fusion": {
+    "type": "language_conditioned_scalar_attention",
+    "num_views": 2,
+    "view_order": ["primary", "wrist"],
+    "score_hidden_dim": 128,
+    "initialization": "uniform_zero_score"
+  },
+  "memory": {"hidden_dim": 512, "heads": 8, "dropout": 0.0},
+  "flow": {
+    "formulation": "conditional_rectified_flow",
+    "dimensions": "motion_only",
+    "hidden_dim": 512,
+    "depth": 3,
+    "dropout": 0.0,
+    "solver": "euler",
+    "num_inference_steps": 4,
+    "deterministic_seed": 7,
+    "share_residual_trunk_across_experts": true,
+    "share_nominal_and_residual_weights": false
+  },
+  "world_model": {
+    "hidden_dim": 512,
+    "layers": 6,
+    "heads": 8,
+    "mlp_ratio": 4,
+    "dropout": 0.0,
+    "route_world_dim": 128,
+    "predict_uncertainty": false
+  },
+  "router": {
+    "hidden_dim": 256,
+    "num_routes": 7,
+    "schedule_length": 16,
+    "top_k": 1,
+    "null_route": 6,
+    "gumbel_temperature_start": 1.0,
+    "gumbel_temperature_end": 0.1,
+    "predicted_route_start_ratio": 0.20,
+    "predicted_route_end_ratio": 0.70
+  },
+  "experts": {
+    "num_motor_experts": 6,
+    "num_routes": 7,
+    "null_route": 6,
+    "max_residual_l2": 0.5
+  },
+  "execution": {
+    "mode": "synchronous_risk_gated",
+    "prediction_horizon": 16,
+    "min_steps": 1,
+    "caution_steps": 4,
+    "default_steps": 8,
+    "max_steps": 8,
+    "allow_confident_skill_boundary_crossing": true,
+    "discard_unexecuted_suffix": true,
+    "stop_before_first_skill_change": false,
+    "async_generation": false,
+    "reuse_previous_tail": false,
+    "risk": {
+      "normalized_entropy_caution": 0.55,
+      "normalized_entropy_high": 0.75,
+      "top2_margin_caution": 0.20,
+      "top2_margin_high": 0.10,
+      "motion_jump_l2_caution": 0.60,
+      "motion_jump_l2_high": 0.90,
+      "residual_l2_caution": 0.35,
+      "residual_l2_high": 0.45
+    }
+  },
+  "action_condition": {"nominal_start_ratio": 0.30, "nominal_end_ratio": 0.70, "final_nominal_probability": 0.80, "distance_beta": 2.0},
+  "loss_weights": {"flow_nominal": 1.0, "flow_expert": 1.0, "gripper_bce": 1.0, "route": 1.0, "world": 1.0, "delta": 0.5, "load_balance": 0.01, "residual": 0.001, "endpoint": 0.0},
+  "validation": {
+    "enabled": true,
+    "eval_freq": 500,
+    "num_batches": 32,
+    "windows_per_episode": 1,
+    "seed": 1701,
+    "run_at_start": true
+  },
+  "skill_expert_config": "configs/mowe_wam/skill_experts.yaml",
+  "training": {
+    "distributed": {
+      "enabled": "auto",
+      "backend": "nccl",
+      "timeout_seconds": 1800,
+      "broadcast_buffers": false,
+      "find_unused_parameters": false,
+      "require_cgroup_metrics": true,
+      "memory_guard_fraction": 0.80,
+      "gpu_memory_guard_fraction": 0.85
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "seed": 7,
+  "learning_rate": 0.0001,
+  "max_steps": 2,
+  "model": {
+    "hidden_dim": 1024,
+    "action_dim": 7,
+    "chunk_size": 8,
+    "num_experts": 5,
+    "top_k": 2,
+    "hidden_layers": [512]
+  },
+  "loss_weights": {
+    "action": 1.0,
+    "predicate": 0.1,
+    "load_balance": 0.01,
+    "temporal_smoothness": 0.0
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "purpose": "legacy_upstream_oft_baseline_dry_run_only_not_mowe_mainline",
+  "checkpoint": "moojink/openvla-7b-oft-finetuned-libero-spatial",
+  "dataset_root": "TBD",
+  "task_suite_name": "libero_spatial",
+  "num_episodes": 1,
+  "max_tasks": 1,
+  "upstream_num_trials_per_task": 1,
+  "output_dir": "outputs/eval/libero_smoke",
+  "status": "dry_run_only_until_LIBERO_env_and_checkpoint_are_available"
+}

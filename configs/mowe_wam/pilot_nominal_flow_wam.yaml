@@ -1,0 +1,26 @@
+{
+  "base_config": "train_nominal_flow_wam.yaml",
+  "output_dir": "outputs/train/stage1_pilot",
+  "teacher": {
+    "checkpoint": "/hy-tmp/facebook-dinov2-small",
+    "cache_path": "/hy-tmp/mowe_dino_cache_v2_complete"
+  },
+  "training": {
+    "batch_size": 1,
+    "grad_accumulation_steps": 8,
+    "max_steps": 100,
+    "save_freq": 25,
+    "log_freq": 5
+  },
+  "data": {
+    "window_shuffle_buffer_size": 8
+  },
+  "validation": {
+    "enabled": true,
+    "eval_freq": 25,
+    "num_batches": 16,
+    "windows_per_episode": 1,
+    "seed": 1701,
+    "run_at_start": true
+  }
+}

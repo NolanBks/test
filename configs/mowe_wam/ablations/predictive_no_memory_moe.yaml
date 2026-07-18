@@ -1,0 +1,10 @@
+{
+  "variant": "predictive_no_memory_moe",
+  "router": {
+    "enabled": true,
+    "inputs": ["features", "future_predicates", "progress_delta", "future_risk", "future_recovery"],
+    "use_future_prediction": true,
+    "use_event_memory": false
+  },
+  "notes": "Deployable future-predictive routing without long-term event memory."
+}

@@ -1,0 +1,1 @@
+{"base_config": "../train_nominal_flow_wam.yaml", "ablation": {"name": "copy_current", "analysis_only": true, "copy_current_prediction": true}}

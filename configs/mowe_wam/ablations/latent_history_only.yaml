@@ -1,0 +1,4 @@
+{
+  "base_config": "../train_predictive_residual_moe.yaml",
+  "ablation": {"name": "latent_history_only", "action_condition": "zeros"}
+}

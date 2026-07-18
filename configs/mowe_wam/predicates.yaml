@@ -1,0 +1,16 @@
+{
+  "predicate_names": [
+    "near_target_object",
+    "contact_likely",
+    "object_grasped",
+    "object_lifted",
+    "object_moving_with_gripper",
+    "near_goal_region",
+    "alignment_required",
+    "progress_score",
+    "failure_risk",
+    "needs_recovery"
+  ],
+  "normalization": "zero_one",
+  "privileged_state_policy": "offline_labels_only"
+}

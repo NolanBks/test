@@ -1,0 +1,75 @@
+{
+  "benchmark": {
+    "name": "calvin",
+    "protocol": "LH-MTLC",
+    "setting": "ABC-D",
+    "train_environments": ["A", "B", "C"],
+    "evaluation_environment": "D",
+    "sequence_length": 5,
+    "evaluation_sequences": 1000,
+    "control_hz": 30,
+    "official_repo": "TBD/calvin",
+    "official_repo_commit": "fa03f01f19c65920e18cf37398a9ce859274af76",
+    "dataset_root": "TBD/task_ABC_D",
+    "use_official_evaluator": true
+  },
+  "observation": {
+    "primary_key": "rgb_obs.rgb_static",
+    "wrist_key": "rgb_obs.rgb_gripper",
+    "proprio_key": "robot_obs",
+    "view_order": ["primary", "wrist"],
+    "use_proprio": false
+  },
+  "training_data": {
+    "accepted_root": "TBD/task_ABC_D/training",
+    "dataset_contract": "official_calvin_abc_language_segments_v1",
+    "language_annotations": "lang_annotations/auto_lang_ann.npy",
+    "action_key": "rel_actions",
+    "camera_keys": ["rgb_static", "rgb_gripper"],
+    "proprio_key": "robot_obs",
+    "min_segment_length": 17,
+    "feature_store": "TBD/calvin_abc_features_v1",
+    "canonical_archive": "TBD/calvin_abc_lerobot_v3",
+    "audit_report": "TBD/calvin_abc_training_audit.json",
+    "skill_config": "TBD/calvin_skill_experts.json",
+    "reject_validation_environment": true
+  },
+  "action": {
+    "action_mode": "relative_cartesian",
+    "rotation_representation": "euler_xyz",
+    "motion_q01": "TBD",
+    "motion_q99": "TBD",
+    "motion_mask": [true, true, true, true, true, true],
+    "gripper_open_value": "TBD",
+    "gripper_closed_value": "TBD",
+    "clip_normalized_motion": true,
+    "statistics_source": "CALVIN ABC training split only"
+  },
+  "policy": {
+    "flow_checkpoint": "TBD",
+    "backbone_checkpoint": "TBD",
+    "history_length": 8,
+    "long_memory_slots": 4,
+    "flow_seed": 1701,
+    "execution_mode": "synchronous_risk_gated",
+    "prediction_horizon": 16,
+    "default_execution_steps": 8,
+    "caution_execution_steps": 4,
+    "allow_confident_skill_boundary_crossing": true,
+    "discard_unexecuted_suffix": true,
+    "reuse_previous_tail": false,
+    "discard_suffix_on_goal_change": true,
+    "preserve_memory_across_subtasks": true,
+    "reset_memory_between_sequences": true,
+    "official_reset_behavior": "official evaluate_policy.py calls model.reset() before each subtask",
+    "required_bridge": "scripts/eval_calvin_flow_wam.py calls reset_sequence() at environment reset",
+    "required_ablation": "preserve_memory_across_subtasks=false"
+  },
+  "report": {
+    "metrics": ["average_sequence_length", "sr_at_1", "sr_at_2", "sr_at_3", "sr_at_4", "sr_at_5"],
+    "extra_metrics": ["per_task_success", "failure_position", "policy_queries", "prefix_lengths"],
+    "bind_repo_commit": true,
+    "bind_checkpoint": true,
+    "bind_seed": true
+  }
+}
