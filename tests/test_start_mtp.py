@@ -94,12 +94,11 @@ class MtpLauncherTests(unittest.TestCase):
                 "ddp_stage1_0_2",
                 "ddp_stage1_2_25",
                 "ddp_stage1_25_100",
-                "ddp_stage1_100_1000",
-                "ddp_stage1_1000_50000",
+                "ddp_stage1_100_50000",
                 "ddp_stage2_0_100",
                 "ddp_stage2_100_50000",
                 "ddp_stage3_0_100",
-                "ddp_stage3_100_30000",
+                "ddp_stage3_100_50000",
             ):
                 self.assertEqual(tasks[name]["status"], "dry_run")
             self.assertIn(
@@ -119,6 +118,17 @@ class MtpLauncherTests(unittest.TestCase):
             )
             self.assertEqual(config["training"]["max_steps"], 50000)
             self.assertEqual(config["training"]["grad_accumulation_steps"], 1)
+            self.assertEqual(config["validation"]["eval_freq"], 500)
+            self.assertEqual(
+                config["validation"]["early_stopping"],
+                {
+                    "enabled": True,
+                    "metric": "total_loss",
+                    "min_delta": 0.0001,
+                    "patience": 5,
+                    "min_steps": 5000,
+                },
+            )
             self.assertEqual(config["training"]["distributed"]["backend"], "nccl")
             self.assertFalse(config["training"]["distributed"]["require_cgroup_metrics"])
             self.assertIn(
@@ -133,6 +143,47 @@ class MtpLauncherTests(unittest.TestCase):
                 "--allow-missing-cgroup-metrics",
                 tasks["readiness_stage1_step100"]["command"],
             )
+
+    def test_stage_stopped_early_requires_matching_checkpoint_and_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory)
+            checkpoint = stage / "checkpoint_latest.pt"
+            checkpoint.write_bytes(b"checkpoint")
+            checkpoint.with_suffix(".pt.metadata.json").write_text(
+                json.dumps(
+                    {
+                        "format": "flow_wam_skill_components_v2",
+                        "stage": "joint",
+                        "step": 7500,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (stage / "early_stopping.json").write_text(
+                json.dumps(
+                    {
+                        "format": "mowe_validation_loss_early_stop_v1",
+                        "stage": "joint",
+                        "stopped_early": True,
+                        "step": 7500,
+                        "max_steps": 50000,
+                        "metric": "total_loss",
+                        "min_delta": 0.0001,
+                        "patience": 5,
+                        "min_steps": 5000,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            launcher = object.__new__(start_mtp.Launcher)
+            launcher.args = Namespace(
+                early_stop_min_delta=0.0001,
+                early_stop_patience=5,
+                early_stop_min_steps=5000,
+            )
+
+            self.assertTrue(launcher.stage_stopped_early(stage, "joint", 50000))
+            self.assertFalse(launcher.stage_stopped_early(stage, "joint", 40000))
 
 
 if __name__ == "__main__":

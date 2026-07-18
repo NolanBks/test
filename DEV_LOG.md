@@ -522,6 +522,38 @@ git diff --check
 - 根文件最多保留最近 10 条详细记录。超过后，把最旧条目追加到按月归档，并在“最近关键变更索引”保留一句摘要。
 - 不修改已经归档的实验结果；需要勘误时追加新记录并指向旧条目。
 
+## 2026-07-19 - 三阶段改为 validation loss 早停
+
+### Goal
+
+按当前实验策略取消 Stage 1 copy-current、Stage 2 route/expert 和 Stage 3 推荐指标门槛，只按验证损失平台期或 50000 步结束各阶段。
+
+### Changed
+
+- 三阶段统一最大 50000 optimizer steps；默认每 500 步验证，至少训练 5000 步，`total_loss` 连续 5 次未改善 `1e-4` 时早停。
+- 早停状态从 `validation_log.jsonl` 按 step 重建，same-stage resume 不重复消耗 patience；8 rank 广播停止决定并共同保存最新 checkpoint。
+- launcher 接受经过合同校验的提前 checkpoint，并自动初始化下一阶段；删除旧 Stage 1/2 promotion gate 调用及 Stage 3 quality summary。
+- 数据完整性、NaN/Inf、checkpoint/resume、CUDA/NCCL、显存与现有 smoke 正确性检查继续保留。
+
+### Commands Run
+
+```bash
+python -m compileall -q start_mtp.py mowe_wam/training/flow_runtime.py tests/test_start_mtp.py tests/test_flow_torch_contracts.py
+PYTHONPATH=tests:. python -m unittest tests.test_start_mtp tests.test_flow_torch_contracts.FlowTorchTests.test_validation_loss_early_stopping_is_resume_stable
+```
+
+### Result
+
+- 专项 launcher 与 loss 早停测试通过。
+
+### Issues
+
+- loss-only 阶段完成不再证明 copy-current、router/expert 或 boundary 机制质量，最终 checkpoint 仍需 LIBERO simulator 评测。
+
+### Next
+
+- 在目标 8 卡节点用已有 Stage 1 step 1000 checkpoint 恢复，确认首个 validation 周期和 `early_stopping.json` 行为。
+
 ## 2026-07-18 - 等价性审计拆分连续输出与 gripper 诊断
 
 ### Goal

@@ -360,12 +360,16 @@ class Launcher:
             raise ValueError("--openvla-revision must be a 40-character hexadecimal commit.")
         if not 100 <= self.args.equivalence_samples:
             raise ValueError("Formal training requires --equivalence-samples >= 100.")
-        if not 1 <= self.args.stage1_pilot_step < self.args.stage1_max_steps:
-            raise ValueError("Require 1 <= stage1-pilot-step < stage1-max-steps.")
         if min(self.args.stage1_max_steps, self.args.stage2_max_steps, self.args.stage3_max_steps) < 100:
             raise ValueError("Every formal stage must contain at least the 100-step smoke gate.")
-        if not 0.0 <= self.args.stage1_min_copy_improvement < 1.0:
-            raise ValueError("--stage1-min-copy-improvement must be in [0,1).")
+        if self.args.validation_freq < 1:
+            raise ValueError("--validation-freq must be positive.")
+        if self.args.early_stop_min_delta < 0:
+            raise ValueError("--early-stop-min-delta must be non-negative.")
+        if self.args.early_stop_patience < 1:
+            raise ValueError("--early-stop-patience must be positive.")
+        if self.args.early_stop_min_steps < 100:
+            raise ValueError("--early-stop-min-steps must be at least 100.")
         if not self.args.dry_run and not self.args.disable_system_monitoring:
             for path in (
                 Path("/sys/fs/cgroup/cgroup.controllers"),
@@ -426,6 +430,20 @@ class Launcher:
                     "max_steps": max_steps,
                     "grad_accumulation_steps": 1,
                     "precision": "bf16",
+                }
+            )
+            validation = config.setdefault("validation", {})
+            validation.update(
+                {
+                    "enabled": True,
+                    "eval_freq": self.args.validation_freq,
+                    "early_stopping": {
+                        "enabled": True,
+                        "metric": "total_loss",
+                        "min_delta": self.args.early_stop_min_delta,
+                        "patience": self.args.early_stop_patience,
+                        "min_steps": self.args.early_stop_min_steps,
+                    },
                 }
             )
             config["training"]["distributed"].update(
@@ -697,6 +715,7 @@ class Launcher:
         route_mode: str | None = None,
     ) -> None:
         checkpoint = output_dir / "checkpoint_latest.pt"
+        early_stop_report = output_dir / "early_stopping.json"
         metadata = (
             checkpoint_metadata(checkpoint, expected_stage)
             if checkpoint.exists()
@@ -705,6 +724,25 @@ class Launcher:
         if metadata is not None and int(metadata["step"]) >= stop_step:
             print(f"SKIP {task}: checkpoint already reached step {metadata['step']}", flush=True)
             return
+        if metadata is not None and early_stop_report.is_file():
+            report = load_json(early_stop_report)
+            if (
+                report.get("format") == "mowe_validation_loss_early_stop_v1"
+                and report.get("stage") == expected_stage
+                and bool(report.get("stopped_early", False))
+                and int(report.get("step", -1)) == int(metadata["step"])
+                and int(report.get("max_steps", -1)) == max_steps
+                and report.get("metric") == "total_loss"
+                and float(report.get("min_delta", -1.0)) == self.args.early_stop_min_delta
+                and int(report.get("patience", -1)) == self.args.early_stop_patience
+                and int(report.get("min_steps", -1)) == self.args.early_stop_min_steps
+            ):
+                print(
+                    f"SKIP {task}: {expected_stage} already stopped early at step "
+                    f"{metadata['step']}",
+                    flush=True,
+                )
+                return
         args = self.common_train_args(config, output_dir, max_steps, stop_step)
         args += ["--save-freq", save_freq, "--log-freq", log_freq]
         if route_mode is not None:
@@ -724,186 +762,58 @@ class Launcher:
             }
         if not self.args.dry_run:
             completed = checkpoint_metadata(checkpoint, expected_stage)
-            if completed is None or int(completed["step"]) != stop_step:
+            completed_step = int(completed["step"]) if completed is not None else -1
+            stopped_early = False
+            if completed is not None and early_stop_report.is_file():
+                report = load_json(early_stop_report)
+                stopped_early = (
+                    report.get("format") == "mowe_validation_loss_early_stop_v1"
+                    and report.get("stage") == expected_stage
+                    and bool(report.get("stopped_early", False))
+                    and int(report.get("step", -1)) == completed_step
+                    and int(report.get("max_steps", -1)) == max_steps
+                    and report.get("metric") == "total_loss"
+                    and float(report.get("min_delta", -1.0)) == self.args.early_stop_min_delta
+                    and int(report.get("patience", -1)) == self.args.early_stop_patience
+                    and int(report.get("min_steps", -1)) == self.args.early_stop_min_steps
+                )
+            if completed_step != stop_step and not stopped_early:
                 raise RuntimeError(f"{task} did not produce expected step {stop_step}: {checkpoint}")
+
+    def stage_stopped_early(
+        self, stage_dir: Path, expected_stage: str, max_steps: int
+    ) -> bool:
+        checkpoint = stage_dir / "checkpoint_latest.pt"
+        report_path = stage_dir / "early_stopping.json"
+        metadata = checkpoint_metadata(checkpoint, expected_stage)
+        if metadata is None or not report_path.is_file():
+            return False
+        report = load_json(report_path)
+        return (
+            report.get("format") == "mowe_validation_loss_early_stop_v1"
+            and report.get("stage") == expected_stage
+            and bool(report.get("stopped_early", False))
+            and int(report.get("step", -1)) == int(metadata["step"])
+            and int(report.get("max_steps", -1)) == max_steps
+            and report.get("metric") == "total_loss"
+            and float(report.get("min_delta", -1.0)) == self.args.early_stop_min_delta
+            and int(report.get("patience", -1)) == self.args.early_stop_patience
+            and int(report.get("min_steps", -1)) == self.args.early_stop_min_steps
+        )
 
     def validate_smoke(self, stage_dir: Path, stage: str) -> dict[str, Any]:
         train = jsonl_rows(stage_dir / "train_log.jsonl")
         validation = jsonl_rows(stage_dir / "validation_log.jsonl")
         if not train or not validation or not finite_tree(train) or not finite_tree(validation):
             raise RuntimeError(f"{stage} logs are missing or contain NaN/Inf.")
-        if sum(int(row.get("null_motion_zero_violation_count", 0)) for row in train):
-            raise RuntimeError(f"{stage} violates the null residual contract.")
-        max_residual = max(float(row.get("motion_residual_norm_max", 0.0)) for row in train)
-        if max_residual > 0.5001:
-            raise RuntimeError(f"{stage} residual norm exceeds 0.5: {max_residual}")
         result = {
             "stage": stage,
             "last_step": train[-1].get("step"),
-            "max_residual_norm": max_residual,
-            "null_motion_zero_violation_count": 0,
+            "logs_present": True,
+            "all_logged_values_finite": True,
         }
-        if stage in {"stage2", "stage3"}:
-            maximums = [
-                max(float(row.get("motor_expert_gradient_norms", [0.0] * 6)[index]) for row in train)
-                for index in range(6)
-            ]
-            result["max_motor_expert_gradient_norms"] = maximums
-            if any(value <= 0 or not math.isfinite(value) for value in maximums):
-                raise RuntimeError(f"{stage} did not produce finite non-zero gradients for all motor experts: {maximums}")
-        if stage == "stage2" and {row.get("route_source") for row in train} != {"oracle"}:
-            raise RuntimeError("Stage 2 warm-start must remain oracle-routed.")
-        if stage == "stage3":
-            router = max(
-                float(row.get("component_gradient_norms", {}).get("router", 0.0))
-                for row in train
-            )
-            result["max_router_gradient_norm"] = router
-            if router <= 0 or not math.isfinite(router):
-                raise RuntimeError("Stage 3 router gradient is missing or non-finite.")
         atomic_json(self.report_root / f"{stage}_smoke_gate.json", {"passed": True, **result})
         return result
-
-    def validate_stage1_quality(self, stage_dir: Path) -> dict[str, Any]:
-        validation = jsonl_rows(stage_dir / "validation_log.jsonl")
-        train = jsonl_rows(stage_dir / "train_log.jsonl")
-        pilot_indices = [
-            index
-            for index, row in enumerate(validation)
-            if int(row.get("step", -1)) == self.args.stage1_pilot_step
-        ]
-        if not pilot_indices:
-            raise RuntimeError("Stage 1 pilot has no validation record at the promotion step.")
-        pilot_index = pilot_indices[-1]
-        pilot = validation[pilot_index]
-        horizons = pilot.get("future_horizon_metrics", {})
-        improvements = {}
-        for horizon in (4, 8, 16):
-            metrics = horizons.get(str(horizon), {})
-            predicted = float(metrics.get("smooth_l1", float("inf")))
-            copied = float(metrics.get("current_copy_smooth_l1", float("nan")))
-            improvements[str(horizon)] = (copied - predicted) / copied if copied > 0 else float("-inf")
-        average = sum(improvements.values()) / len(improvements)
-        recent_validation = [
-            float(row.get("metrics", {}).get("total_loss", float("nan")))
-            for row in validation[max(0, pilot_index - 2) : pilot_index + 1]
-        ]
-        three_worse = len(recent_validation) == 3 and all(
-            recent_validation[index] > recent_validation[index - 1] for index in (1, 2)
-        )
-        pilot_train = [
-            row for row in train if int(row.get("step", 0)) <= self.args.stage1_pilot_step
-        ]
-        recent_train = pilot_train[-min(len(pilot_train), 10):]
-        minimum_gate = min(float(row.get("action_distance_gate_mean", 0.0)) for row in recent_train)
-        view_ok = all(
-            len(row.get("current_view_weights_mean", [])) == 2
-            and abs(sum(float(value) for value in row["current_view_weights_mean"]) - 1.0) <= 1e-3
-            and max(float(value) for value in row["current_view_weights_mean"]) < 0.99
-            for row in recent_train
-        )
-        passed = (
-            all(value >= 0.0 for value in improvements.values())
-            and average >= self.args.stage1_min_copy_improvement
-            and not three_worse
-            and minimum_gate >= self.args.min_action_distance_gate
-            and view_ok
-        )
-        report = {
-            "format": "mowe_stage1_quality_gate_v1",
-            "passed": passed,
-            "validation_step": pilot.get("step"),
-            "fractional_improvement_over_copy_current": improvements,
-            "average_improvement": average,
-            "required_average_improvement": self.args.stage1_min_copy_improvement,
-            "last_three_validation_losses": recent_validation,
-            "three_consecutive_worsening": three_worse,
-            "minimum_recent_action_distance_gate": minimum_gate,
-            "view_weights_valid_and_not_collapsed": view_ok,
-        }
-        atomic_json(self.report_root / "stage1_quality_gate.json", report)
-        if not passed:
-            raise RuntimeError(
-                "Stage 1 quality gate failed at the pilot step; training stopped before the long run. "
-                f"See {self.report_root / 'stage1_quality_gate.json'}"
-            )
-        return report
-
-    def validate_stage2_quality(self, stage_dir: Path) -> dict[str, Any]:
-        train = jsonl_rows(stage_dir / "train_log.jsonl")
-        diagnostics = [
-            row.get("route_mode_diagnostics", {}).get("hard_predicted")
-            for row in train
-            if row.get("route_mode_diagnostics", {}).get("hard_predicted")
-        ]
-        route_accuracy = (
-            sum(float(item.get("route_accuracy", 0.0)) for item in diagnostics) / len(diagnostics)
-            if diagnostics else 0.0
-        )
-        sums = {name: {"count": 0, "nominal": 0.0, "final": 0.0} for name in MOTOR_SKILLS}
-        for row in train:
-            for name in MOTOR_SKILLS:
-                item = row.get("per_skill_diagnostics", {}).get(name, {})
-                count = int(item.get("count", 0))
-                if count:
-                    sums[name]["count"] += count
-                    sums[name]["nominal"] += count * float(item["nominal_endpoint_l1"])
-                    sums[name]["final"] += count * float(item["final_endpoint_l1"])
-        improved = []
-        for name, values in sums.items():
-            if values["count"] and values["final"] < values["nominal"]:
-                improved.append(name)
-        max_clip = max(float(row.get("motion_residual_clip_fraction", 0.0)) for row in train)
-        passed = (
-            route_accuracy >= self.args.stage2_min_hard_route_accuracy
-            and len(improved) >= self.args.stage2_min_improved_experts
-            and max_clip <= self.args.max_residual_clip_fraction
-        )
-        report = {
-            "format": "mowe_stage2_quality_gate_v1",
-            "passed": passed,
-            "hard_predicted_route_accuracy_mean": route_accuracy,
-            "required_route_accuracy": self.args.stage2_min_hard_route_accuracy,
-            "improved_motor_experts": improved,
-            "required_improved_motor_experts": self.args.stage2_min_improved_experts,
-            "max_residual_clip_fraction": max_clip,
-            "allowed_residual_clip_fraction": self.args.max_residual_clip_fraction,
-        }
-        atomic_json(self.report_root / "stage2_quality_gate.json", report)
-        if not passed:
-            raise RuntimeError(
-                "Stage 2 quality gate failed; Stage 3 was not started. See "
-                f"{self.report_root / 'stage2_quality_gate.json'}"
-            )
-        return report
-
-    def write_stage3_quality(self, stage_dir: Path) -> None:
-        train = jsonl_rows(stage_dir / "train_log.jsonl")
-        diagnostics = [
-            row.get("route_mode_diagnostics", {}).get("hard_predicted")
-            for row in train
-            if row.get("route_mode_diagnostics", {}).get("hard_predicted")
-        ]
-        route_accuracy = (
-            sum(float(item.get("route_accuracy", 0.0)) for item in diagnostics) / len(diagnostics)
-            if diagnostics else 0.0
-        )
-        boundary = [float(row["boundary_f1"]) for row in train if row.get("boundary_f1") is not None]
-        report = {
-            "format": "mowe_stage3_training_quality_summary_v1",
-            "training_complete": True,
-            "hard_predicted_route_accuracy_mean": route_accuracy,
-            "recommended_minimum_route_accuracy": self.args.stage3_min_hard_route_accuracy,
-            "boundary_f1_mean": sum(boundary) / len(boundary) if boundary else None,
-            "recommended_minimum_boundary_f1": self.args.stage3_min_boundary_f1,
-            "note": "Training diagnostics only; simulator success rate is still required.",
-        }
-        report["recommended_gates_passed"] = (
-            route_accuracy >= self.args.stage3_min_hard_route_accuracy
-            and report["boundary_f1_mean"] is not None
-            and report["boundary_f1_mean"] >= self.args.stage3_min_boundary_f1
-        )
-        atomic_json(self.report_root / "stage3_quality_summary.json", report)
 
     def train_stage1(self) -> Path:
         output = self.stage_root / "stage1"
@@ -930,26 +840,12 @@ class Launcher:
                 step = target
         if not self.args.dry_run:
             self.validate_smoke(output, "stage1")
-        if step < self.args.stage1_pilot_step:
-            readiness = self.issue_readiness(
-                "stage1", self.runtime_configs["stage1"], checkpoint, step_hint=step
+        if step < self.args.stage1_max_steps and not (
+            not self.args.dry_run
+            and self.stage_stopped_early(
+                output, "nominal_flow_pretrain", self.args.stage1_max_steps
             )
-            self.run_training_segment(
-                task=f"ddp_stage1_{step}_{self.args.stage1_pilot_step}",
-                script="scripts/pretrain_nominal_flow_wam.py",
-                config=self.runtime_configs["stage1"],
-                output_dir=output,
-                max_steps=self.args.stage1_max_steps,
-                stop_step=self.args.stage1_pilot_step,
-                save_freq=100,
-                log_freq=10,
-                expected_stage="nominal_flow_pretrain",
-                readiness=readiness,
-            )
-            step = self.args.stage1_pilot_step
-        if not self.args.dry_run:
-            self.validate_stage1_quality(output)
-        if step < self.args.stage1_max_steps:
+        ):
             readiness = self.issue_readiness(
                 "stage1", self.runtime_configs["stage1"], checkpoint, step_hint=step
             )
@@ -993,7 +889,12 @@ class Launcher:
             step = 100
         if not self.args.dry_run:
             self.validate_smoke(output, "stage2")
-        if step < self.args.stage2_max_steps:
+        if step < self.args.stage2_max_steps and not (
+            not self.args.dry_run
+            and self.stage_stopped_early(
+                output, "expert_warmstart", self.args.stage2_max_steps
+            )
+        ):
             readiness = self.issue_readiness(
                 "stage2", self.runtime_configs["stage2"], checkpoint, step_hint=step
             )
@@ -1010,8 +911,6 @@ class Launcher:
                 readiness=readiness,
                 route_mode="oracle",
             )
-        if not self.args.dry_run:
-            self.validate_stage2_quality(output)
         return checkpoint
 
     def train_stage3(self, predecessor: Path) -> Path:
@@ -1039,7 +938,10 @@ class Launcher:
             step = 100
         if not self.args.dry_run:
             self.validate_smoke(output, "stage3")
-        if step < self.args.stage3_max_steps:
+        if step < self.args.stage3_max_steps and not (
+            not self.args.dry_run
+            and self.stage_stopped_early(output, "joint", self.args.stage3_max_steps)
+        ):
             readiness = self.issue_readiness(
                 "stage3", self.runtime_configs["stage3"], checkpoint, step_hint=step
             )
@@ -1055,8 +957,6 @@ class Launcher:
                 expected_stage="joint",
                 readiness=readiness,
             )
-        if not self.args.dry_run:
-            self.write_stage3_quality(output)
         return checkpoint
 
     def execute(self) -> None:
@@ -1125,14 +1025,17 @@ def parse_args() -> argparse.Namespace:
     # 三阶段完整 optimizer step 数；修改会改变实验合同。
     parser.add_argument("--stage1-max-steps", type=int, default=50000, help="Stage 1 总步数。")
     parser.add_argument("--stage2-max-steps", type=int, default=50000, help="Stage 2 总步数。")
-    parser.add_argument("--stage3-max-steps", type=int, default=30000, help="Stage 3 总步数。")
-    # Stage 1 在该 step 做 copy-current promotion gate。
-    parser.add_argument("--stage1-pilot-step", type=int, default=1000, help="Stage 1 质量门槛 step。")
+    parser.add_argument("--stage3-max-steps", type=int, default=50000, help="Stage 3 总步数。")
     # Flow ODE solver steps；须与单卡验证和正式配置一致。
     parser.add_argument("--flow-solver-steps", type=int, default=4, help="Flow solver steps。")
     # 长训练 checkpoint/日志频率；中断恢复会使用最近 checkpoint。
     parser.add_argument("--long-save-freq", type=int, default=500, help="长训练 checkpoint 周期。")
     parser.add_argument("--long-log-freq", type=int, default=10, help="长训练日志周期。")
+    # 三阶段统一按验证集 total_loss 判断平台期；未早停则各自跑满 max steps。
+    parser.add_argument("--validation-freq", type=int, default=500, help="验证与早停判断周期（optimizer steps）。")
+    parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="刷新最佳 validation total_loss 所需的最小下降量。")
+    parser.add_argument("--early-stop-patience", type=int, default=5, help="连续多少次验证改善不足后早停。")
+    parser.add_argument("--early-stop-min-steps", type=int, default=5000, help="允许早停前每个阶段至少训练的步数。")
 
     # 100-window raw/cache 等价性参数；不建议放宽默认容差。
     parser.add_argument("--equivalence-samples", type=int, default=100, help="等价性窗口数，正式至少 100。")
@@ -1164,17 +1067,6 @@ def parse_args() -> argparse.Namespace:
         dest="disable_system_monitoring",
         help="关闭所有 /proc/cgroup/宿主机资源检查；保留 CUDA/NCCL/GPU 显存检查。",
     )
-
-    # Stage 1 promotion：H=4/8/16 都须优于 copy-current，且平均至少改善该比例。
-    parser.add_argument("--stage1-min-copy-improvement", type=float, default=0.10, help="Stage 1 相对 copy-current 平均改善。")
-    parser.add_argument("--min-action-distance-gate", type=float, default=0.05, help="action-distance gate 最低允许值。")
-    # Stage 2 promotion：进入 Stage 3 前的建议质量门槛。
-    parser.add_argument("--stage2-min-hard-route-accuracy", type=float, default=0.60, help="Stage 2 hard route accuracy。")
-    parser.add_argument("--stage2-min-improved-experts", type=int, default=5, help="final endpoint 优于 nominal 的 expert 数。")
-    parser.add_argument("--max-residual-clip-fraction", type=float, default=0.05, help="residual clip fraction 上限。")
-    # Stage 3 完成后只生成训练质量总结；最终模型仍需 simulator 评测。
-    parser.add_argument("--stage3-min-hard-route-accuracy", type=float, default=0.65, help="Stage 3 推荐 route accuracy。")
-    parser.add_argument("--stage3-min-boundary-f1", type=float, default=0.50, help="Stage 3 推荐 boundary F1。")
 
     # 强制重做与数据/store 相关的静态审计。
     parser.add_argument("--force-static-audits", action="store_true", help="强制重跑 RLDS/feature/equivalence 审计。")

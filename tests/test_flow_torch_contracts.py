@@ -26,6 +26,7 @@ from mowe_wam.training.flow_runtime import (
     make_grad_scaler,
     read_flow_checkpoint_metadata,
     save_flow_checkpoint,
+    validation_loss_early_stopping_state,
     validate_checkpoint_contract,
     validate_resume_schedule_contract,
     _mechanism_metrics,
@@ -45,6 +46,47 @@ class FlowTorchTests(unittest.TestCase):
         self.weights = load_config("configs/mowe_wam/train_flow_wam_skill_moe.yaml")[
             "loss_weights"
         ]
+
+    def test_validation_loss_early_stopping_is_resume_stable(self):
+        def record(step, loss):
+            return {
+                "stage": "joint",
+                "step": step,
+                "metrics": {"total_loss": loss},
+            }
+
+        records = [
+            record(0, 3.0),
+            record(500, 2.0),
+            record(1000, 1.0),
+            record(1500, 0.99995),
+            record(2000, 0.99994),
+            record(2500, 0.99993),
+            record(3000, 0.99992),
+            record(3500, 0.99991),
+            record(3500, 0.99991),
+        ]
+        before_minimum = validation_loss_early_stopping_state(
+            records,
+            stage="joint",
+            min_delta=1e-4,
+            patience=5,
+            min_steps=5000,
+        )
+        self.assertFalse(before_minimum["should_stop"])
+        self.assertEqual(before_minimum["bad_validation_count"], 5)
+        self.assertEqual(before_minimum["validation_count"], 8)
+
+        records.append(record(5000, 0.99990))
+        stopped = validation_loss_early_stopping_state(
+            records,
+            stage="joint",
+            min_delta=1e-4,
+            patience=5,
+            min_steps=5000,
+        )
+        self.assertTrue(stopped["should_stop"])
+        self.assertEqual(stopped["current_step"], 5000)
 
     def test_view_fusion_starts_uniform_and_is_language_conditioned(self):
         from mowe_wam.models import LanguageConditionedViewFusion

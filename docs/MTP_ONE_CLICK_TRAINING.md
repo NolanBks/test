@@ -6,11 +6,13 @@
 2. RLDS/skill config、formal feature-store checksum 与 8-rank assignment 审计。
 3. 100-window raw/cache 等价性审计。
 4. 同一节点、同一 boot、同一 cgroup 的 8-rank feature-store soak 和 8-GPU runtime audit。
-5. Stage 1：`0→2→25→100→1000→50000`，在 step 100/1000 重新签发 checkpoint-bound readiness，并在 step 1000 检查 future predictor 相对 copy-current 的质量门槛。
-6. Stage 2：`0→100→50000`，使用 Stage 1 最终 checkpoint 初始化，签发 Stage 2 readiness，完成后检查 expert/route promotion gate。
-7. Stage 3：`0→100→30000`，使用 Stage 2 最终 checkpoint 初始化并签发 Stage 3 readiness。
+5. Stage 1：`0→2→25→100→最多 50000`，在 step 100 签发 checkpoint-bound readiness，之后按 validation `total_loss` 自动早停。
+6. Stage 2：`0→100→最多 50000`，使用 Stage 1 最终 checkpoint 初始化，签发 Stage 2 readiness，之后使用相同的 loss 早停规则。
+7. Stage 3：`0→100→最多 50000`，使用 Stage 2 最终 checkpoint 初始化并签发 Stage 3 readiness，之后使用相同的 loss 早停规则。
 
-任何审计、readiness、资源门槛或质量门槛失败时，脚本立即停止并保留 checkpoint、报告和日志，不会自动放宽阈值。
+三个阶段默认每 500 步验证一次；至少训练 5000 步后，如果最佳 validation `total_loss` 连续 5 次没有下降至少 `1e-4`，当前阶段保存 checkpoint 并正常结束，启动下一阶段。若一直未触发早停，则在 50000 步结束。copy-current、route accuracy、expert improvement、boundary F1 等指标不再作为阶段晋级条件。
+
+任何审计、readiness、数据/分布式正确性或资源门槛失败时，脚本仍立即停止并保留 checkpoint、报告和日志，不会自动放宽阈值。
 
 ## 1. 新服务器必须准备的内容
 
@@ -44,7 +46,7 @@ GPU 数必须是 8，cgroup v2 文件必须存在。
 --disable-system-monitoring
 ```
 
-该显式降级模式不会读取 cgroup、`/proc` boot/cgroup identity 或宿主机内存/OOM 指标；仍强制检查 8 卡 CUDA、NCCL rank/GPU 绑定、GPU 显存、数据完整性、checkpoint 合同和阶段质量门槛。报告会标为降级资源证据，不能与带 cgroup 监控的正式节点证据混用。
+该显式降级模式不会读取 cgroup、`/proc` boot/cgroup identity 或宿主机内存/OOM 指标；仍强制检查 8 卡 CUDA、NCCL rank/GPU 绑定、GPU 显存、数据完整性和 checkpoint 合同。报告会标为降级资源证据，不能与带 cgroup 监控的正式节点证据混用。
 
 ## 2. 推荐启动命令
 
@@ -112,8 +114,11 @@ python start_mtp.py \
 --cuda-devices 0,1,2,3,4,5,6,7
 --stage1-max-steps 50000
 --stage2-max-steps 50000
---stage3-max-steps 30000
---stage1-pilot-step 1000
+--stage3-max-steps 50000
+--validation-freq 500
+--early-stop-min-delta 1e-4
+--early-stop-patience 5
+--early-stop-min-steps 5000
 --flow-solver-steps 4
 --equivalence-samples 100
 --soak-steps 10000
@@ -128,7 +133,7 @@ python start_mtp.py \
 python start_mtp.py --help
 ```
 
-不建议放宽以下参数：feature/output/loss 容差、imbalance ratio、内存增长/斜率、GPU/cgroup guard、Stage 1/2 promotion gate。若真实运行失败，应保留报告并分析原因。
+`--early-stop-min-delta` 越大越容易认为没有改善，`--early-stop-patience` 越小越容易提前结束，`--early-stop-min-steps` 控制最早结束 step。建议先保留上述默认值。数据等价性容差、imbalance ratio、内存增长/斜率和 GPU/cgroup guard 不建议放宽。
 
 ## 5. 自动恢复
 
@@ -166,15 +171,13 @@ python start_mtp.py --help
     feature_store_soak_8rank.json
     ddp_runtime_8gpu.json
     readiness_stage*_step*.json
-    stage1_quality_gate.json
-    stage2_quality_gate.json
-    stage3_quality_summary.json
     *.log
   ddp8/
     stage1/
       checkpoint_latest.pt
       train_log.jsonl
       validation_log.jsonl
+      early_stopping.json
     stage2/
     stage3/
 ```
@@ -190,9 +193,9 @@ python start_mtp.py --help
 - soak 出现 OOM/OOM-kill 或内存增长/斜率超标。
 - readiness 与 store/config/checkpoint/node identity 不匹配。
 - checkpoint stage/step、same-stage schedule 或 predecessor 不合法。
-- loss/gradient 出现 NaN/Inf，null residual 非零，residual norm 超过 0.5。
-- Stage 1 step 1000 未达到 copy-current promotion gate。
-- Stage 2 长训练未达到 route/expert promotion gate，因此不会启动 Stage 3。
+- loss/gradient 或验证日志出现 NaN/Inf。
+
+copy-current、router/expert promotion 和 boundary 指标不会再阻止阶段切换。`early_stopping.json` 中 `reason=validation_loss_plateau` 表示 loss 平台期正常结束，`reason=max_steps` 表示跑满 50000 步；两者都不是错误退出。
 
 这些停止条件是训练合同的一部分，不应通过更换 `run-id` 或放宽参数规避。
 

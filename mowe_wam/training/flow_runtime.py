@@ -1916,6 +1916,83 @@ def _write_json_atomic(path, payload) -> None:
     temporary.replace(path)
 
 
+def validation_loss_early_stopping_state(
+    records: list[dict[str, Any]],
+    *,
+    stage: str,
+    metric: str = "total_loss",
+    min_delta: float = 1e-4,
+    patience: int = 5,
+    min_steps: int = 5000,
+) -> dict[str, Any]:
+    """Rebuild deterministic loss-only early-stopping state from validation logs."""
+
+    if min_delta < 0:
+        raise ValueError("validation.early_stopping.min_delta must be non-negative.")
+    if patience < 1:
+        raise ValueError("validation.early_stopping.patience must be positive.")
+    if min_steps < 0:
+        raise ValueError("validation.early_stopping.min_steps must be non-negative.")
+    if not metric:
+        raise ValueError("validation.early_stopping.metric must be non-empty.")
+
+    # Re-launching a segment evaluates the checkpoint step again. Keep only the
+    # newest value for each step so resume does not consume patience twice.
+    losses_by_step: dict[int, float] = {}
+    for record in records:
+        if record.get("stage") != stage:
+            continue
+        try:
+            step = int(record["step"])
+            value = float(record.get("metrics", {})[metric])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            raise RuntimeError(
+                f"Validation metric {metric!r} is non-finite at step {step}: {value}"
+            )
+        losses_by_step[step] = value
+
+    best_value: float | None = None
+    current_value: float | None = None
+    current_step = 0
+    bad_validation_count = 0
+    for current_step, current_value in sorted(losses_by_step.items()):
+        if best_value is None or best_value - current_value >= min_delta:
+            best_value = current_value
+            bad_validation_count = 0
+        else:
+            bad_validation_count += 1
+
+    should_stop = (
+        current_value is not None
+        and current_step >= min_steps
+        and bad_validation_count >= patience
+    )
+    return {
+        "metric": metric,
+        "best_value": best_value,
+        "current_value": current_value,
+        "current_step": current_step,
+        "bad_validation_count": bad_validation_count,
+        "validation_count": len(losses_by_step),
+        "min_delta": float(min_delta),
+        "patience": int(patience),
+        "min_steps": int(min_steps),
+        "should_stop": should_stop,
+    }
+
+
+def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 _DISTRIBUTED_SUM_KEYS = {
     "execution_reason_histogram",
     "execution_selected_boundary_count",
@@ -2497,8 +2574,26 @@ def _run_flow_training_impl(
     validation_log_path = output_dir / "validation_log.jsonl"
     validation_cfg = cfg.get("validation", {})
     validation_freq = int(validation_cfg.get("eval_freq", 500))
+    early_stopping_cfg = validation_cfg.get("early_stopping", {})
+    early_stopping_enabled = bool(early_stopping_cfg.get("enabled", False))
+    early_stopping_metric = str(early_stopping_cfg.get("metric", "total_loss"))
+    early_stopping_min_delta = float(early_stopping_cfg.get("min_delta", 1e-4))
+    early_stopping_patience = int(early_stopping_cfg.get("patience", 5))
+    early_stopping_min_steps = int(early_stopping_cfg.get("min_steps", 5000))
+    early_stopping_report_path = output_dir / "early_stopping.json"
     if bool(validation_cfg.get("enabled", False)) and validation_freq < 1:
         raise ValueError("validation.eval_freq must be positive.")
+    if early_stopping_enabled and not bool(validation_cfg.get("enabled", False)):
+        raise ValueError("validation must be enabled when early stopping is enabled.")
+    if early_stopping_enabled:
+        validation_loss_early_stopping_state(
+            [],
+            stage=stage,
+            metric=early_stopping_metric,
+            min_delta=early_stopping_min_delta,
+            patience=early_stopping_patience,
+            min_steps=early_stopping_min_steps,
+        )
     if accumulation < 1 or log_freq < 1 or save_freq < 1:
         raise ValueError(
             "grad_accumulation_steps, log_freq, and save_freq must be positive."
@@ -2784,6 +2879,7 @@ def _run_flow_training_impl(
             step % validation_freq == 0 or step == stop_step
         ):
             distributed.barrier()
+            early_stopping_state = None
             if distributed.is_main:
                 validation_record = evaluate_flow_model(
                     cfg,
@@ -2794,6 +2890,16 @@ def _run_flow_training_impl(
                 )
                 _write_jsonl(validation_log_path, validation_record)
                 print(json.dumps(_jsonable(validation_record), sort_keys=True), flush=True)
+                if early_stopping_enabled:
+                    early_stopping_state = validation_loss_early_stopping_state(
+                        _read_jsonl_records(validation_log_path),
+                        stage=stage,
+                        metric=early_stopping_metric,
+                        min_delta=early_stopping_min_delta,
+                        patience=early_stopping_patience,
+                        min_steps=early_stopping_min_steps,
+                    )
+            early_stopping_state = distributed.broadcast_object(early_stopping_state)
             distributed.barrier()
             validation_resources = process_resource_metrics(distributed)
             enforce_cgroup_memory_guard(
@@ -2805,6 +2911,70 @@ def _run_flow_training_impl(
             enforce_no_new_oom_events(
                 distributed, validation_resources, resource_baseline
             )
+            if (
+                early_stopping_state
+                and bool(early_stopping_state["should_stop"])
+                and step < max_steps
+            ):
+                rng_state_by_rank = distributed.all_gather_objects(
+                    local_rng_state(distributed)
+                )
+                local_sampler_state = sampler.state_dict() if isinstance(
+                    sampler, EpisodeAwareDistributedSampler
+                ) else None
+                sampler_state_by_rank = distributed.all_gather_objects(
+                    local_sampler_state
+                )
+                if distributed.is_main:
+                    save_flow_checkpoint(
+                        output_dir / "checkpoint_latest.pt",
+                        raw_model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        step,
+                        cfg,
+                        stage,
+                        schedule_state,
+                        distributed_metadata=cfg["distributed_contract"],
+                        rng_state_by_rank=rng_state_by_rank,
+                        sampler_state_by_rank=sampler_state_by_rank,
+                    )
+                    report = {
+                        "format": "mowe_validation_loss_early_stop_v1",
+                        "stage": stage,
+                        "reason": "validation_loss_plateau",
+                        "stopped_early": True,
+                        "step": int(step),
+                        "max_steps": int(max_steps),
+                        **early_stopping_state,
+                    }
+                    _write_json_atomic(early_stopping_report_path, report)
+                    print(json.dumps(_jsonable(report), sort_keys=True), flush=True)
+                distributed.barrier()
+                break
+    if distributed.is_main and stop_step == max_steps and step >= max_steps:
+        final_state = validation_loss_early_stopping_state(
+            _read_jsonl_records(validation_log_path),
+            stage=stage,
+            metric=early_stopping_metric,
+            min_delta=early_stopping_min_delta,
+            patience=early_stopping_patience,
+            min_steps=early_stopping_min_steps,
+        ) if early_stopping_enabled else {}
+        _write_json_atomic(
+            early_stopping_report_path,
+            {
+                "format": "mowe_validation_loss_early_stop_v1",
+                "stage": stage,
+                "reason": "max_steps",
+                "stopped_early": False,
+                "step": int(step),
+                "max_steps": int(max_steps),
+                **final_state,
+            },
+        )
+    distributed.barrier()
     return output_dir / "checkpoint_latest.pt"
 
 
