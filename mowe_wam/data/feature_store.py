@@ -837,6 +837,60 @@ class MoWEFeatureWindowDataset(_DatasetBase):
             pass
 
 
+class EpisodeBalancedValidationSampler(_SamplerBase):
+    """Select a deterministic sparse set of windows from every episode.
+
+    Feature-store windows are stored episode-contiguously. Iterating the first
+    ``N`` validation windows therefore evaluates one long trajectory rather
+    than ``N`` independent episodes. This sampler hashes the episode identity,
+    selects a fixed number of windows inside each episode, and then hashes the
+    episode order. The result is stable across processes and remounted store
+    paths while ensuring that an evaluation prefix contains distinct episodes.
+    """
+
+    def __init__(
+        self,
+        dataset: MoWEFeatureWindowDataset,
+        *,
+        windows_per_episode: int = 1,
+        seed: int = 1701,
+    ) -> None:
+        require_torch()
+        self.dataset = dataset
+        self.windows_per_episode = int(windows_per_episode)
+        self.seed = int(seed)
+        if self.windows_per_episode < 1:
+            raise ValueError("windows_per_episode must be positive.")
+        positions_by_episode = dataset.window_positions_by_episode()
+        ordered_episodes = sorted(
+            positions_by_episode,
+            key=lambda episode_index: hashlib.sha256(
+                f"{self.seed}:{dataset._episode_by_index[episode_index]['episode_id']}".encode()
+            ).hexdigest(),
+        )
+        self.selected_episode_indices = tuple(ordered_episodes)
+        self.selected_episode_ids = tuple(
+            str(dataset._episode_by_index[index]["episode_id"])
+            for index in ordered_episodes
+        )
+        self.positions: list[int] = []
+        for episode_index in ordered_episodes:
+            positions = list(positions_by_episode[episode_index])
+            episode_id = str(dataset._episode_by_index[episode_index]["episode_id"])
+            random.Random(f"{self.seed}:{episode_id}:windows").shuffle(positions)
+            self.positions.extend(positions[: self.windows_per_episode])
+
+    @property
+    def episode_count(self) -> int:
+        return len(self.selected_episode_indices)
+
+    def __iter__(self) -> Iterable[int]:
+        return iter(self.positions)
+
+    def __len__(self) -> int:
+        return len(self.positions)
+
+
 class EpisodeAwareDistributedSampler(_SamplerBase):
     """Assign complete episodes to ranks and resume an exact local cursor."""
 

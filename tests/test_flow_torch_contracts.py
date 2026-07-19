@@ -26,6 +26,7 @@ from mowe_wam.training.flow_runtime import (
     make_grad_scaler,
     read_flow_checkpoint_metadata,
     save_flow_checkpoint,
+    schedule_aware_early_stopping_min_steps,
     validation_loss_early_stopping_state,
     validate_checkpoint_contract,
     validate_resume_schedule_contract,
@@ -74,10 +75,21 @@ class FlowTorchTests(unittest.TestCase):
             min_steps=5000,
         )
         self.assertFalse(before_minimum["should_stop"])
-        self.assertEqual(before_minimum["bad_validation_count"], 5)
-        self.assertEqual(before_minimum["validation_count"], 8)
+        self.assertEqual(before_minimum["bad_validation_count"], 0)
+        self.assertEqual(before_minimum["validation_count"], 0)
+        self.assertEqual(before_minimum["pre_schedule_validation_count"], 8)
 
-        records.append(record(5000, 0.99990))
+        records.extend(
+            [
+                record(5000, 1.0),
+                record(5500, 1.00001),
+                record(6000, 1.00002),
+                record(6500, 1.00003),
+                record(7000, 1.00004),
+                record(7500, 1.00005),
+                record(7500, 1.00005),
+            ]
+        )
         stopped = validation_loss_early_stopping_state(
             records,
             stage="joint",
@@ -86,7 +98,34 @@ class FlowTorchTests(unittest.TestCase):
             min_steps=5000,
         )
         self.assertTrue(stopped["should_stop"])
-        self.assertEqual(stopped["current_step"], 5000)
+        self.assertEqual(stopped["current_step"], 7500)
+        self.assertEqual(stopped["best_step"], 5000)
+
+    def test_early_stopping_waits_for_deployment_schedule_and_episode_diversity(self):
+        cfg = load_config("configs/mowe_wam/train_flow_wam_skill_moe.yaml")
+        cfg["training"]["max_steps"] = 50000
+        cfg.setdefault("validation", {}).setdefault("early_stopping", {})[
+            "require_schedule_completion"
+        ] = True
+        self.assertEqual(
+            schedule_aware_early_stopping_min_steps(cfg, "joint", 5000),
+            35000,
+        )
+        record = {
+            "stage": "joint",
+            "step": 35000,
+            "validation_mode": "deployment",
+            "unique_episodes": 1,
+            "metrics": {"total_loss": 1.0},
+        }
+        with self.assertRaisesRegex(RuntimeError, "episode-diverse"):
+            validation_loss_early_stopping_state(
+                [record],
+                stage="joint",
+                min_steps=35000,
+                validation_mode="deployment",
+                min_unique_episodes=32,
+            )
 
     def test_view_fusion_starts_uniform_and_is_language_conditioned(self):
         from mowe_wam.models import LanguageConditionedViewFusion
@@ -614,6 +653,17 @@ class FlowTorchTests(unittest.TestCase):
         self.assertEqual(first["episode_partition"], "validation")
         self.assertEqual(first["batches"], 1)
         self.assertIn("total_loss", first["metrics"])
+        deployment = evaluate_flow_model(
+            cfg,
+            self.model,
+            [self.batch],
+            stage="nominal_flow_pretrain",
+            step=0,
+            validation_mode="deployment",
+        )
+        self.assertEqual(deployment["action_condition_mode"], "nominal")
+        self.assertEqual(deployment["route_mode"], "predicted")
+        self.assertIn("current_view_weights_mean", deployment["deployment_metrics"])
 
     def test_stage1_has_no_trainable_parameter_without_gradient(self):
         cfg = load_config("configs/mowe_wam/train_nominal_flow_wam.yaml")

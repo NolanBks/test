@@ -131,6 +131,8 @@
     "eval_freq": 500,
     "num_batches": 32,
     "windows_per_episode": 1,
+    "min_unique_episodes": 1,
+    "modes": ["diagnostic", "deployment"],
     "seed": 1701,
     "run_at_start": true
   },

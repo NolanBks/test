@@ -18,8 +18,9 @@ class MtpLauncherTests(unittest.TestCase):
         launcher.args = Namespace(dry_run=True)
         launcher.preflight = MagicMock()
         launcher.ensure_static_evidence = MagicMock(return_value=Path("skill.json"))
-        launcher.ensure_node_evidence = MagicMock()
         launcher.train_stage1 = MagicMock(return_value=Path("stage1.pt"))
+        launcher.stage_root = Path("stages")
+        launcher.validate_stage1_quality = MagicMock()
         launcher.train_stage2 = MagicMock(return_value=Path("stage2.pt"))
         launcher.train_stage3 = MagicMock(return_value=Path("stage3.pt"))
         launcher.record = MagicMock()
@@ -28,6 +29,7 @@ class MtpLauncherTests(unittest.TestCase):
             launcher.execute()
 
         launcher.train_stage1.assert_called_once_with()
+        launcher.validate_stage1_quality.assert_called_once_with(Path("stages/stage1"))
         launcher.train_stage2.assert_called_once_with(Path("stage1.pt"))
         launcher.train_stage3.assert_called_once_with(Path("stage2.pt"))
 
@@ -69,7 +71,6 @@ class MtpLauncherTests(unittest.TestCase):
                 str(output),
                 "--run-id",
                 "dry-run",
-                "--disable-system-monitoring",
                 "--dry-run",
             ]
 
@@ -89,12 +90,11 @@ class MtpLauncherTests(unittest.TestCase):
             for name in (
                 "feature_store_audit",
                 "feature_equivalence",
-                "feature_store_soak_8rank",
-                "ddp_runtime_8gpu",
                 "ddp_stage1_0_2",
                 "ddp_stage1_2_25",
                 "ddp_stage1_25_100",
-                "ddp_stage1_100_50000",
+                "ddp_stage1_100_1000",
+                "ddp_stage1_1000_50000",
                 "ddp_stage2_0_100",
                 "ddp_stage2_100_50000",
                 "ddp_stage3_0_100",
@@ -126,23 +126,49 @@ class MtpLauncherTests(unittest.TestCase):
                     "metric": "total_loss",
                     "min_delta": 0.0001,
                     "patience": 5,
-                    "min_steps": 5000,
+                    "min_steps": 35000,
+                    "validation_mode": "deployment",
+                    "require_schedule_completion": True,
                 },
             )
+            self.assertIsNone(config["validation"]["num_batches"])
+            self.assertEqual(config["validation"]["min_unique_episodes"], 32)
+            self.assertEqual(
+                config["validation"]["modes"], ["diagnostic", "deployment"]
+            )
+            self.assertEqual(tasks["stage1_quality_gate"]["status"], "dry_run")
             self.assertEqual(config["training"]["distributed"]["backend"], "nccl")
-            self.assertFalse(config["training"]["distributed"]["require_cgroup_metrics"])
-            self.assertIn(
-                "--disable-system-monitoring",
-                tasks["feature_store_soak_8rank"]["command"],
+            self.assertFalse(
+                config["training"]["distributed"]["resource_monitoring"]
             )
-            self.assertIn(
-                "--disable-system-monitoring",
-                tasks["ddp_runtime_8gpu"]["command"],
+            self.assertNotIn(
+                "require_cgroup_metrics", config["training"]["distributed"]
             )
-            self.assertIn(
-                "--allow-missing-cgroup-metrics",
-                tasks["readiness_stage1_step100"]["command"],
+            self.assertNotIn(
+                "memory_guard_fraction", config["training"]["distributed"]
             )
+            self.assertNotIn(
+                "gpu_memory_guard_fraction", config["training"]["distributed"]
+            )
+            self.assertEqual(
+                config["long_run_readiness"]["mode"],
+                "disabled_no_resource_monitoring",
+            )
+            rendered_commands = "\n".join(
+                " ".join(str(value) for value in task.get("command", []))
+                for task in tasks.values()
+            ).lower()
+            for forbidden in (
+                "soak_mowe_feature_store",
+                "audit_ddp_runtime",
+                "audit_long_training_readiness",
+                "long-run-readiness",
+                "system-monitoring",
+                "cgroup",
+                "memory-guard",
+                "gpu-memory",
+            ):
+                self.assertNotIn(forbidden, rendered_commands)
 
     def test_stage_stopped_early_requires_matching_checkpoint_and_contract(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -154,7 +180,7 @@ class MtpLauncherTests(unittest.TestCase):
                     {
                         "format": "flow_wam_skill_components_v2",
                         "stage": "joint",
-                        "step": 7500,
+                        "step": 37500,
                     }
                 ),
                 encoding="utf-8",
@@ -165,25 +191,110 @@ class MtpLauncherTests(unittest.TestCase):
                         "format": "mowe_validation_loss_early_stop_v1",
                         "stage": "joint",
                         "stopped_early": True,
-                        "step": 7500,
+                        "step": 37500,
                         "max_steps": 50000,
                         "metric": "total_loss",
                         "min_delta": 0.0001,
                         "patience": 5,
-                        "min_steps": 5000,
+                        "min_steps": 35000,
+                        "validation_mode": "deployment",
                     }
                 ),
                 encoding="utf-8",
             )
             launcher = object.__new__(start_mtp.Launcher)
-            launcher.args = Namespace(
-                early_stop_min_delta=0.0001,
-                early_stop_patience=5,
-                early_stop_min_steps=5000,
+            config = stage / "stage3.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "validation": {
+                            "early_stopping": {
+                                "metric": "total_loss",
+                                "min_delta": 0.0001,
+                                "patience": 5,
+                                "min_steps": 35000,
+                                "validation_mode": "deployment",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
             )
+            launcher.runtime_configs = {"stage3": str(config)}
 
             self.assertTrue(launcher.stage_stopped_early(stage, "joint", 50000))
             self.assertFalse(launcher.stage_stopped_early(stage, "joint", 40000))
+
+    def test_stage1_quality_gate_requires_diverse_deployment_improvement(self):
+        record = {
+            "stage": "nominal_flow_pretrain",
+            "step": 35000,
+            "validation_mode": "deployment",
+            "unique_episodes": 78,
+            "sampling_contract": "episode_balanced_deterministic_v1",
+            "future_horizon_metrics": {
+                str(horizon): {"smooth_l1": 0.8, "current_copy_smooth_l1": 1.0}
+                for horizon in (4, 8, 16)
+            },
+            "deployment_metrics": {
+                "mean_nominal_action_distance_gate": 0.5,
+                "current_view_weights_mean": [0.45, 0.55],
+            },
+        }
+        passed = start_mtp.stage1_quality_gate([record])
+        self.assertTrue(passed["passed"], passed)
+        failed = start_mtp.stage1_quality_gate(
+            [{**record, "unique_episodes": 1}]
+        )
+        self.assertFalse(failed["passed"])
+        self.assertIn("insufficient_unique_validation_episodes", failed["errors"])
+        nonfinite = start_mtp.stage1_quality_gate(
+            [
+                {
+                    **record,
+                    "deployment_metrics": {
+                        **record["deployment_metrics"],
+                        "mean_nominal_action_distance_gate": float("nan"),
+                    },
+                }
+            ]
+        )
+        self.assertFalse(nonfinite["passed"])
+        self.assertIn("nominal_action_distance_gate_collapsed", nonfinite["errors"])
+
+    def test_existing_stage_must_match_selected_predecessor_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            predecessor = root / "checkpoint_best.pt"
+            predecessor.touch()
+            predecessor_metadata = {
+                "format": "flow_wam_skill_components_v2",
+                "stage": "nominal_flow_pretrain",
+                "step": 35000,
+                "config": {"stage": "nominal_flow_pretrain", "training": {}},
+                "data_contract": {"feature_store_contract": {"format": "test"}},
+                "backbone_identifier": "backbone-test",
+            }
+            predecessor.with_suffix(".pt.metadata.json").write_text(
+                json.dumps(predecessor_metadata), encoding="utf-8"
+            )
+            launcher = object.__new__(start_mtp.Launcher)
+            matching = {
+                "config": {
+                    "initialization_contract": start_mtp.checkpoint_predecessor_identity(
+                        predecessor_metadata
+                    )
+                }
+            }
+            launcher.validate_stage_predecessor(
+                matching, predecessor, stage_name="Stage 2"
+            )
+            with self.assertRaisesRegex(RuntimeError, "different predecessor"):
+                launcher.validate_stage_predecessor(
+                    {"config": {"initialization_contract": None}},
+                    predecessor,
+                    stage_name="Stage 2",
+                )
 
 
 if __name__ == "__main__":

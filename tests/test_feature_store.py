@@ -8,6 +8,7 @@ from contextlib import redirect_stdout
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     import numpy as np
@@ -18,6 +19,7 @@ except ModuleNotFoundError:
 
 from mowe_wam.data.feature_store import (
     EpisodeAwareDistributedSampler,
+    EpisodeBalancedValidationSampler,
     MoWEFeatureStoreWriter,
     MoWEFeatureWindowDataset,
     audit_feature_store,
@@ -423,6 +425,23 @@ class FeatureStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Sampler resume contract"):
                 incompatible.load_state_dict(state)
 
+    def test_validation_sampler_selects_distinct_episodes_deterministically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._build_store(root)
+            dataset = MoWEFeatureWindowDataset(root, partition="train")
+            first = EpisodeBalancedValidationSampler(
+                dataset, windows_per_episode=1, seed=1701
+            )
+            second = EpisodeBalancedValidationSampler(
+                dataset, windows_per_episode=1, seed=1701
+            )
+            self.assertEqual(list(first), list(second))
+            self.assertEqual(first.episode_count, 3)
+            self.assertEqual(len(first), 3)
+            episode_ids = [dataset[index]["episode_id"] for index in first]
+            self.assertEqual(len(set(episode_ids)), 3)
+
     def test_precomputed_backbone_preserves_context_shapes(self):
         from mowe_wam.backbones import PrecomputedFeatureBackbone
 
@@ -586,19 +605,37 @@ class FeatureStoreTests(unittest.TestCase):
                     "stop_step": 1,
                     "save_freq": 1,
                     "log_freq": 1,
-                    "distributed": {"enabled": False, "memory_guard_fraction": 0.99},
+                    "distributed": {
+                        "enabled": False,
+                        "resource_monitoring": False,
+                    },
                 }
             )
             cfg["validation"]["enabled"] = False
-            with redirect_stdout(io.StringIO()):
-                checkpoint = run_flow_training(copy.deepcopy(cfg), stage="nominal_flow_pretrain")
-            metadata = read_flow_checkpoint_metadata(checkpoint)
-            self.assertEqual(metadata["step"], 1)
-            self.assertEqual(metadata["sampler_state_by_rank"][0]["cursor"], 1)
+            with (
+                patch(
+                    "mowe_wam.training.flow_runtime.process_resource_metrics",
+                    side_effect=AssertionError("resource telemetry must stay disabled"),
+                ),
+                patch(
+                    "mowe_wam.training.flow_runtime.local_runtime_identity",
+                    side_effect=AssertionError("runtime telemetry must stay disabled"),
+                ),
+                patch(
+                    "mowe_wam.training.flow_runtime.enforce_long_run_readiness",
+                    side_effect=AssertionError("resource readiness must stay disabled"),
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                checkpoint = run_flow_training(
+                    copy.deepcopy(cfg), stage="nominal_flow_pretrain"
+                )
+                metadata = read_flow_checkpoint_metadata(checkpoint)
+                self.assertEqual(metadata["step"], 1)
+                self.assertEqual(metadata["sampler_state_by_rank"][0]["cursor"], 1)
 
-            resume_cfg = copy.deepcopy(cfg)
-            resume_cfg["training"]["stop_step"] = 2
-            with redirect_stdout(io.StringIO()):
+                resume_cfg = copy.deepcopy(cfg)
+                resume_cfg["training"]["stop_step"] = 2
                 resumed = run_flow_training(
                     resume_cfg, stage="nominal_flow_pretrain", resume=str(checkpoint)
                 )

@@ -1,6 +1,6 @@
 # MoWE-WAM 当前实现与执行计划
 
-更新时间：2026-07-17（活动文档；完整历史规格已归档）
+更新时间：2026-07-19（活动文档；完整历史规格已归档）
 
 本文档是后续 Codex/agent 编程时默认读取的实现入口，只保留当前事实、关键合同、未完成门槛和下一步顺序。文档瘦身前的完整规格保存在 [`docs/history/IMPLEMENTATION_PLAN_FULL_2026-07-17.md`](docs/history/IMPLEMENTATION_PLAN_FULL_2026-07-17.md)，仅在追溯具体设计、旧任务或历史命令时按章节读取，禁止在新会话启动时默认全文加载。
 
@@ -61,8 +61,10 @@ LIBERO/CALVIN episodic windows or mowe_feature_store_v1
 - 原始 `openvla/openvla-7b` non-leaky context、OFT-compatible 双视角加载/融合、DINO visual target 和 cache。
 - nominal motion flow、独立 gripper head、Latent WAM、temporal router、六 motor residual-flow experts、null bypass。
 - Stage 1/2/3 CLI/runtime、checkpoint/resume、日志、preflight、机制分析。
-- 单机 DDP、episode-aware sharding/sampler、rank-0 I/O、资源与 cgroup fail-closed 门禁。
+- 单机 DDP、episode-aware sharding/sampler、rank-0 I/O；通用 runtime 仍保留可选资源诊断，但 `start_mtp.py` 明确关闭且不调用任何系统/内存监控。
 - `mowe_feature_store_v1`、canonical archive、可恢复 converter、结构/equivalence/soak/readiness 审计。
+- feature-store validation 使用确定性的 episode-balanced sparse sampler；正式 launcher 同时记录 diagnostic 与 deployment 两种验证，早停只使用 deployment loss，并等待动作/路由课程调度完成。
+- `checkpoint_best.pt`、Stage 1 `copy_current` 质量门和 Stage 2/3 predecessor identity 校验已实现；`checkpoint_latest.pt` 仍只用于精确 same-stage resume。
 - 可恢复 LIBERO full-suite evaluator。
 - CALVIN action/policy bridge、ABC dataset/converter、feature-store configs 和官方 evaluator bridge。
 
@@ -70,8 +72,9 @@ LIBERO/CALVIN episodic windows or mowe_feature_store_v1
 
 - 本地 synthetic/contract、CPU 2-rank Gloo DDP 和 checkpoint resume 已有通过记录；修改代码后仍应重跑相关测试。
 - 云端 RTX 4090 已记录旧 LIBERO-OFT backbone 下的真实 Stage 1 step 0→100、resume，以及 Stage 2 oracle one-step/25-step coverage gate；这些结果只证明历史代码路径，不满足新的原始-backbone训练合同，也不能作为新 lineage 的 resume 起点。
-- Stage 1 future predictor 尚未证明优于 `copy_current`。
-- 真实 8×A100/A800 NCCL、全量 formal feature store、100-window raw/cache equivalence、长期 cgroup soak、Stage 3 真实训练、LIBERO 正式 success rate、CALVIN 正式训练与官方评测均未完成。
+- 已完成的一轮 8 卡 launcher 输出暴露出旧验证/早停合同问题：validation prefix 仅覆盖 1 个 episode，Stage 1/2/3 分别约在 11k/7.5k/5k 早停，Stage 3 尚未进入 predicted-route、各阶段尚未完成 nominal-action 课程；这些结果不能作为机制或正式模型质量证据。
+- Stage 1 future predictor 尚未在修正后的 episode-balanced deployment validation 上证明优于 `copy_current`。
+- 修正版一键入口的真实 8×A100/A800 NCCL、Stage 3 真实训练、LIBERO 正式 success rate、CALVIN 正式训练与官方评测均未完成。
 - 代码存在、CLI 可运行、mock/contract 测试通过，均不能替代上述真实证据。
 
 ## 2. 当前唯一优先执行链
@@ -83,15 +86,13 @@ LIBERO/CALVIN episodic windows or mowe_feature_store_v1
 3. **LIBERO 转换 smoke**：用原始 backbone 和 2 个 episode 生成 non-formal feature store/canonical archive，完成结构审计；smoke store 不得进入正式训练。
 4. **LIBERO 全量转换**：仅从通过 smoke 的同一原始-backbone snapshot 生成满足 expected/actual episode、frame、window counts 的 formal store。
 5. **等价性和数据审计**：至少 100 个真实窗口验证 raw original-backbone/store 的 views、language、DINO、actions、skills、完整 outputs/losses；冻结 8-rank suite/window/skill imbalance 上限。
-6. **目标节点证据**：完成 CPU 8-rank continuous soak 和 8-GPU DDP runtime audit；cgroup/CUDA 指标缺失直接失败。
-7. **新 Stage 1 lineage 阶梯**：不恢复任何旧 OFT-backbone checkpoint；使用正式 50,000-step 配置从 step 0 新建 8 卡 lineage，依次验证 `0→2→25→100→1000`。same-stage resume 只改变 `stop_step`，从第一步起保持 `max_steps=50000` 和全部优化语义。
-8. **签发 readiness**：针对原始-backbone step-100 checkpoint 聚合 formal store、feature audit、100-window equivalence、soak、8-GPU runtime 和 checkpoint lineage；每次主动停止后针对最新 checkpoint 重新签发。
-9. **Stage 1 连续训练**：加载 readiness report 后先从 step 100 连续训练到 1000，质量门槛通过并针对 step-1000 checkpoint 重新签发 readiness 后，再继续到 50,000。
-10. **机制门槛**：future predictor 明确优于 `copy_current` 后，才启动 Stage 2/3 长训练；随后完成 Stage 3 真实 optimizer/resume gate。
-11. **正式评测**：先完成 LIBERO one-task/1-trial smoke，再完成四 suite 可恢复正式评测与机制分析。
-12. **CALVIN 第二基准**：仅在 LIBERO 主线稳定后，以同一原始 backbone identity 重新生成 CALVIN 独立 store，完成 ABC 独立三阶段训练和 D 环境官方 1,000-sequence LH-MTLC 评测。
+6. **新 Stage 1 lineage 阶梯**：不恢复任何旧 OFT-backbone checkpoint；使用正式 50,000-step 配置从 step 0 新建 8 卡 lineage，依次验证 `0→2→25→100→1000`。same-stage resume 只改变 `stop_step`，从第一步起保持 `max_steps=50000` 和全部优化语义。
+7. **Stage 1 连续训练**：从 step 100 连续训练到 1000，再继续到最多 50,000；早停不得早于 nominal-action 课程完成。
+8. **机制门槛**：选择 eligible deployment loss 最优的 `checkpoint_best.pt`，并在至少 32 个不同 validation episode 上要求 H=4/8/16 相对 `copy_current` 的平均改善至少 10%、任一 horizon 不得退化；通过后才启动 Stage 2/3。Stage 3 早停还必须等待 predicted-route 课程完成，并完成真实 optimizer/resume gate。
+9. **正式评测**：先完成 LIBERO one-task/1-trial smoke，再完成四 suite 可恢复正式评测与机制分析。
+10. **CALVIN 第二基准**：仅在 LIBERO 主线稳定后，以同一原始 backbone identity 重新生成 CALVIN 独立 store，完成 ABC 独立三阶段训练和 D 环境官方 1,000-sequence LH-MTLC 评测。
 
-任何步骤失败时停在该层解决；不要通过放宽 readiness、资源、数据完整性或泄漏门槛绕过。
+任何步骤失败时停在该层解决；不要通过放宽数据完整性、checkpoint、训练质量或泄漏门槛绕过。系统资源监控由平台侧负责，不进入一键脚本。
 
 ## 3. 不可漂移的实现合同
 
@@ -129,8 +130,11 @@ LIBERO/CALVIN episodic windows or mowe_feature_store_v1
   - `scripts/train_flow_wam_skill_moe.py`
 - Stage 2 只从 Stage 1 predecessor 初始化；Stage 3 只从 Stage 2 predecessor 初始化。same-stage 使用 `--resume`，跨 stage 使用 `--init-wam`。
 - same-stage resume 必须保持 seed、stage、precision、完整 `max_steps`、optimizer/LR/schedule/loss/window/route contract 不变；只允许调整 `stop_step`、`save_freq`、`log_freq`。
+- 正式 feature-store validation 每个 validation episode 确定性抽取一个窗口，同时输出 diagnostic（GT action；Stage 2/3 oracle route）和 deployment（nominal action + predicted route）记录；早停只读取 deployment `total_loss`，且至少覆盖 32 个不同 episode。
+- 默认 50,000-step 合同下，early-stopping patience 只能从 action conditioning 与（Stage 3）predicted-route schedule 完成后的 step 35,000 开始累计；此前验证只用于诊断，不得消耗 patience。
+- 每个阶段把 eligible deployment loss 最优状态保存为 `checkpoint_best.pt`；跨阶段初始化使用 best checkpoint，并把其 path-independent semantic identity 写入下一阶段 checkpoint。若 predecessor 改变，旧 Stage 2/3 checkpoint 必须 fail closed，不能拼接 lineage。
 - 正式 DDP 合同为 world size 8、BF16、per-device batch 1、accumulation 1、effective global batch 8、NCCL、`num_workers=0`、`pin_memory=false`。
-- 同一 checkpoint lineage 累计超过 100 个未认证 optimizer steps 时，训练入口必须要求匹配的 `--long-run-readiness-report`。
+- `start_mtp.py` 生成的三阶段配置固定 `resource_monitoring=false`，不读取 `/proc`/cgroup、RSS、OOM event 或 GPU memory telemetry，也不运行 soak/runtime/readiness 资源审计；数据审计、等价性、checkpoint 和质量门继续 fail closed。
 
 ### 3.4 Benchmark 隔离
 
@@ -244,25 +248,7 @@ torchrun --standalone --nproc-per-node=8 scripts/pretrain_nominal_flow_wam.py \
   --stop-step 25
 ```
 
-继续到 100/1000/50000 时只改 `--stop-step`，`--max-steps` 始终保持 50000；超过 100 steps 前及每次主动停止后的恢复都必须使用 checkpoint-bound readiness。完整显式参数与门槛以 `docs/CLOUD_TRAINING_RUNBOOK.md` 为准。不得恢复旧 OFT-backbone checkpoint 或重定义 scheduler horizon。
-
-### 6.5 Readiness 聚合
-
-```bash
-python scripts/audit_long_training_readiness.py \
-  --config configs/mowe_wam/ddp8_nominal_flow_wam_feature_store_formal.yaml \
-  --store /ABS/formal_libero_feature_store \
-  --feature-audit /ABS/feature_audit.json \
-  --equivalence-report /ABS/equivalence_100.json \
-  --soak-report /ABS/soak_8rank.json \
-  --ddp-runtime-audit /ABS/ddp8_runtime.json \
-  --checkpoint /ABS/stage1_openvla_base_ddp8/checkpoint_latest.pt \
-  --checkpoint-mode resume \
-  --world-size 8 \
-  --output /ABS/stage1_openvla_base_step200_readiness.json
-```
-
-正式训练必须把匹配报告传给 `--long-run-readiness-report`。报告与 store、config、stage、world size、优化语义或 checkpoint lineage 任一不一致时都应重新生成。
+继续到 100/1000/50000 时只改 `--stop-step`，`--max-steps` 始终保持 50000。完整一键参数以 `docs/MTP_ONE_CLICK_TRAINING.md` 为准。不得恢复旧 OFT-backbone checkpoint 或重定义 scheduler horizon。
 
 ## 7. 当前任务状态
 
@@ -272,8 +258,8 @@ python scripts/audit_long_training_readiness.py \
 | LIBERO sequence/skill join | 已实现并有真实结构审计记录 | formal feature-store 全量计数 |
 | 原始 OpenVLA/DINO/memory | loader/缓存代码已实现；现有真实训练记录来自旧 OFT backbone | 固定 base revision、双视角 smoke、重建 store、100-window raw/cache equivalence |
 | Flow-WAM/router/experts | 已实现 | Stage 3 真实 optimizer/resume |
-| 单机 DDP | 代码与 2-rank CPU contract 已完成 | 8-rank NCCL/runtime/资源证据 |
-| Feature store/archive | 核心代码完成 | 全量 conversion、checksum、soak、readiness |
+| 单机 DDP | 代码与 2-rank CPU contract 已完成 | 修正版一键入口 8-rank NCCL 实跑 |
+| Feature store/archive | 核心代码与正式 store/checksum 完成 | 保持数据审计通过 |
 | LIBERO evaluator | 代码完成 | one-task smoke 和四-suite 正式结果 |
 | CALVIN adapter/converter/evaluator | 代码与 synthetic contract 完成 | ABC 全量数据、训练、D 环境官方结果 |
 | 消融实验 | 本轮暂缓；已有配置保留 | 主训练与双 benchmark 稳定后再排期 |
@@ -286,10 +272,8 @@ python scripts/audit_long_training_readiness.py \
 - store、resolved config、checkpoint 与 evaluator 均绑定同一个已签发 `openvla/openvla-7b` immutable revision/weight fingerprint；不存在旧 OFT-backbone lineage 混入。
 - 100 个真实窗口 raw/cache equivalence 通过，benchmark identity 与 store 一致。
 - 8-rank episode union 完整且互斥；suite/window/skill imbalance 上限由真实 audit 后人工确认。
-- CPU 8-rank soak 覆盖要求的步数/reshuffle，anon 和 working-set 增长/斜率低于门槛，`oom/oom_kill` 无新增。
-- 8-GPU runtime audit 证明 NCCL、rank/GPU 绑定、BF16、有效 batch、cgroup/CUDA 指标和资源阈值满足合同。
 - checkpoint stage、world size、effective batch 和 same-stage schedule 合法；Stage 1 lineage 从原始 backbone step 0 建立，不发生 backbone migration。
-- readiness report 由当前证据生成并被训练入口消费。
+- 一键 dry-run 展开完整 Stage 1→2→3 init/resume 链，且命令中不存在系统资源监控、soak 或 resource readiness 操作。
 - Stage 1 future predictor 相对 `copy_current` 的改善达到继续训练的实验判断门槛。
 
 ## 9. 第一版 Definition of Done

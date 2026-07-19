@@ -1,6 +1,6 @@
 # MoWE-WAM 当前状态与近期开发日志
 
-更新时间：2026-07-18
+更新时间：2026-07-19
 
 本文件是新会话默认读取的活动日志，只保留当前快照和最近变更索引。2026-07-08 至文档瘦身前的完整逐条记录保存在 [`docs/history/DEV_LOG_2026-07-08_to_2026-07-17.md`](docs/history/DEV_LOG_2026-07-08_to_2026-07-17.md)。需要核对旧命令、输出或失败原因时，先用 `rg` 定位，再读取命中章节；禁止在启动时全文加载历史归档。
 
@@ -10,7 +10,7 @@
 
 - 研究主线为 `Nominal Flow Policy + Verb-Seeded Residual Flow Skill Experts + MAW Routing`。
 - 第一版唯一 frozen context backbone 已固定为 immutable revision 的原始 `openvla/openvla-7b`；`external/openvla-oft` 只作为双视角兼容 loader，不使用 LIBERO-finetuned OFT 权重。
-- 当前优先级是在目标 8 卡节点通过 `start_mtp.py` 完成 8-rank soak、8-GPU runtime/readiness 与正式 Stage 1→2→3；LIBERO 正式训练/评测稳定后再推进 CALVIN。
+- 当前优先级是在目标 8 卡节点通过无系统资源监控的 `start_mtp.py` 完成正式 Stage 1→2→3；LIBERO 正式训练/评测稳定后再推进 CALVIN。
 - 旧 predicate/event 和 regression residual-MoE 代码只作为 baseline 保留。
 
 ### 当前代码事实
@@ -34,24 +34,149 @@
 - 4090 formal store `/hy-tmp/mowe_store/libero_h16_formal_4090` 已完成：1,693 episodes、273,465 frames、246,377 windows，expected/actual counts 和全 shard checksum/8-rank assignment audit 均通过。
 - 最终真实 100-window mask-aware equivalence 已通过：100/100 pair、无 missing、`masks_match=true`、`max_feature_gate_error=0.00427994`、`max_output_gate_error=0.00221920`、`max_loss_gate_error=0.01294136`、`passed=true`。
 - 单卡 A100 已分别完成原始-backbone Stage 1/2/3 step 0→100 工程验证：checkpoint stage/lineage 正确、loss/gradient 有限、Stage 2 六个 motor expert 与 Stage 3 router 梯度合同通过。它们不是正式 8 卡 lineage 的初始化 checkpoint。
-- `start_mtp.py` 已实现单入口 8 卡正式训练编排与断点恢复，并配套 `docs/MTP_ONE_CLICK_TRAINING.md`；当前只有 dry-run/合同测试证据，尚未在真实 8 卡节点完整执行该 launcher。
-- 对于 MTP 未开放 `/proc`/cgroup 的容器，launcher 现提供显式 `--disable-system-monitoring` 降级模式：跳过系统/cgroup/OOM/boot 资源证据，保留 CUDA、NCCL、GPU 显存、数据和训练质量门槛；其报告会明确标注为 degraded，不能与标准 cgroup 证据混用。
+- `start_mtp.py` 已实现单入口 8 卡正式训练编排与断点恢复，并配套 `docs/MTP_ONE_CLICK_TRAINING.md`；服务器已真实执行过旧合同的一轮，但下述验证/早停问题使其不能作为正式质量证据。
+- 服务器上一轮 launcher 虽以退出码 0 完成，但旧 early-stopping/validation 合同使 Stage 1/2/3 分别约在 11,000/7,500/5,000 step 结束；全部 validation 只覆盖 1 个 episode，Stage 3 全程 oracle route，各阶段仍为 GT-action conditioning。该轮只能证明工程链路可跑通，不能证明训练充分或模型有效。
+- validation/early-stopping 已修正为 episode-balanced deterministic sampling、diagnostic/deployment 双模式、schedule-aware deployment-only patience；各阶段新增 `checkpoint_best.pt`，Stage 1 新增跨 episode 的 `copy_current` 质量门，Stage 2/3 新增 predecessor semantic identity 校验。
+- 一键入口现永久关闭资源 telemetry：不读取 `/proc`/cgroup、RSS、OOM event 或 GPU memory，不运行 feature-store soak、resource runtime audit 或 resource readiness；数据、等价性、checkpoint、validation、early stopping 和 Stage 1 质量门保持启用。
 - raw/cache equivalence 的 raw matcher 现优先使用 formal store 已记录的精确 `(source_file_key, source_traj_index, step_id)`，只有旧 store 缺少该 provenance 时才回退图像摘要 `episode_id`；这修复跨服务器同计数/同 manifest 下的少量 image-fingerprint missing pair，不会放宽 100/100 gate。
 - 真实 8×GPU Stage 1 step 0→2 首次运行在完成 step 1 后触发 DDP unused-parameter reducer 错误；参数索引已精确映射为 nominal trunk 的可选 `token_condition_projection` 与 Stage-1 无监督的 `world_model.route_world_head`，stage 配置现按真实梯度路径冻结它们，Stage 2/3 会重新启用 route-world head。
 
 ### 尚未完成
 
-- 目标节点 CPU 8-rank continuous soak 和 8×A100/A800 NCCL/runtime/cgroup 证据。
-- 原始-backbone新 lineage 的 step 0→2→25→100→1000→50000 DDP Stage 1 链路及 checkpoint-bound readiness。
-- Stage 1 future predictor 明确优于 `copy_current`。
+- 修正后的 launcher 尚未在服务器重新运行；因此还没有 episode-balanced deployment validation、step≥35,000 early-stopping 或 `checkpoint_best.pt` 的真实 GPU 证据。
+- 原始-backbone新 lineage 的修正版 step 0→2→25→100→1000→最多50000 DDP Stage 1 链路。
+- Stage 1 future predictor 在至少 32 个不同 validation episode 上明确优于 `copy_current`。
 - Stage 3 真实 optimizer/resume、LIBERO 四 suite 正式结果和机制消融。
 - CALVIN ABC 全量转换/训练及 D 环境官方 1,000-sequence 评测。
 
 ### 下一步
 
-1. 将 repo、RLDS、formal store、OpenVLA、DINO 和 sidecar 挂载到目标 8 卡节点，先用 `start_mtp.py --dry-run` 核对全部解析路径与命令。
-2. 使用完全相同的 `run-root-dir`/`run-id` 去掉 `--dry-run` 正式启动；launcher 必须先通过 node-bound soak/runtime/readiness，随后才从 Stage 1 step 0 建立正式 lineage。
-3. 若平台没有系统资源指标权限，在 dry-run 和正式命令均追加 `--disable-system-monitoring`；这会降低资源证据等级，运行中应额外用平台控制台观察 CPU RAM、GPU memory 和 OOM。
+1. 将本次修正版 repo 同步到目标 8 卡节点，用新的 `run-id` 执行 `start_mtp.py --dry-run`；不要把旧 Stage 2/3 checkpoint 接到改变后的 Stage 1 predecessor。
+2. 去掉 `--dry-run` 从 step 0 建立修正版正式 lineage，并确认 validation 记录中 `sampling_contract=episode_balanced_deterministic_v1`、`validation_mode=deployment`、`unique_episodes>=32`。
+3. Stage 1 只在 `checkpoint_best.pt` 的 `mowe_stage1_quality_gate_v2` 通过后进入 Stage 2；默认 50,000-step 合同不得在 step 35,000 前早停。
+4. 资源配额与告警完全由 MTP/云平台承担；一键命令不再接受或需要任何 monitoring 参数。
+
+## 2026-07-19 - 写入 MTP v2 重新训练操作
+
+### Goal
+
+把用户下一次服务器重训所需的准确 run-id、dry-run、合同检查、正式启动和中断恢复步骤写入一键训练文档。
+
+### Changed
+
+- `docs/MTP_ONE_CLICK_TRAINING.md` 将本次 lineage 固定为 `libero_original_openvla_h16_v2`，明确保留但不得续接旧 `v1` Stage 1/2/3 checkpoint。
+- 写入服务器实际路径下可直接执行的 dry-run 和正式命令；两者除 `--dry-run` 外参数完全一致，不包含 monitoring/soak/resource readiness 参数。
+- 新增 dry-run JSON 合同检查，验证三阶段任务链完整、所有 task 为 dry-run、三份 runtime config 关闭 resource telemetry、命令中不存在资源监控操作。
+- 明确中断后用原正式命令恢复，以及必须更换 run-id 的合同变更边界。
+
+### Commands Run
+
+```bash
+python -c '<extract docs/MTP_ONE_CLICK_TRAINING.md dry-run checker; ast.parse(...)>'
+python -c '<check Markdown fence parity and exactly two v2 launch commands>'
+rg -n 'run-id|libero_original_openvla_h16_v[12]|disable-system|soak|readiness|memory.guard|cgroup' \
+  docs/MTP_ONE_CLICK_TRAINING.md
+git diff --check
+```
+
+### Result
+
+- 文档内嵌 dry-run JSON checker 通过 Python AST 语法检查。
+- Markdown fence 数量成对，dry-run/正式命令各有且仅有一个 `--run-id libero_original_openvla_h16_v2`；旧 `v1` 只出现在禁止复用说明中。
+- `git diff --check` 通过；未启动服务器命令或 GPU 训练。
+
+### Issues
+
+- 本次只写入可执行操作说明，没有在服务器启动 dry-run 或真实训练。
+
+### Next
+
+- 用户同步当前代码后，执行文档 2.1 的 v2 dry-run 和 JSON 合同检查；通过后执行 2.2 正式命令。
+
+## 2026-07-19 - 一键训练移除全部系统资源监控操作
+
+### Goal
+
+保证 `start_mtp.py` 仍能从数据审计一路启动 Stage 1→2→3 完整训练，同时不执行系统、进程或设备内存监控。
+
+### Changed
+
+- 从 launcher 删除 cgroup/`/proc` node identity、feature-store soak、DDP resource runtime audit、resource readiness，以及相关 CLI 参数和报告依赖。
+- 正式运行只用 PyTorch 核对 8 张 CUDA 设备可见；不采集 RSS、cgroup memory、OOM event 或 GPU allocated/reserved/total memory。
+- run-local Stage 1/2/3 config 固定 `training.distributed.resource_monitoring=false`；Flow runtime 在该配置下跳过全部 `process_resource_metrics`、resource guard 和 `local_runtime_identity` 调用。
+- 保留 formal store checksum/8-rank assignment、100-window equivalence、checkpoint/resume、episode-balanced deployment validation、schedule-aware early stopping、best checkpoint、Stage 1 质量门及 Stage 2/3 predecessor identity。
+- 训练阶段仍按 `0→2→25→100→1000→最多50000`、`0→100→最多50000`、`0→100→最多50000` 完整展开；资源配额与告警交由平台。
+
+### Commands Run
+
+```bash
+/Users/tt/miniconda3/envs/mowe/bin/python -m compileall -q mowe_wam scripts tests start_mtp.py
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -p 'test_start_mtp.py' -v
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -p 'test_feature_store.py' -v
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -p 'test_flow_torch_contracts.py' -v
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -p 'test_flow_distributed.py' -v
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -v
+/Users/tt/miniconda3/envs/mowe/bin/python start_mtp.py --help
+git diff --check
+```
+
+### Result
+
+- launcher、feature-store/runtime、Flow Torch、2-rank DDP 共 38 项专项测试全部通过；compileall、CLI help 与 `git diff --check` 通过。
+- dry-run 完整展开 Stage 1→2→3 的 init/resume 链；生成配置不含 cgroup/GPU memory guard 字段，所有任务命令不含 soak、resource runtime audit、resource readiness 或 monitoring 参数。
+- runtime 测试把 `process_resource_metrics` 与 `local_runtime_identity` patch 为一旦调用即失败；一步训练和 same-stage resume 均通过，证明 `resource_monitoring=false` 分支不触发资源采集。
+- 完整发现共 82 项、81 项通过；唯一失败仍是本机默认环境缺少既有 OpenVLA-OFT `prismatic` 依赖，与本次 launcher/runtime 修改无关。
+
+### Issues
+
+- 一键脚本不再主动发现内存逼近配额或 OOM event；这是用户明确要求的运行边界，不应在 launcher 内重新加入。
+- 尚未在真实 8 GPU 节点执行修改后的完整训练。
+
+### Next
+
+- 在服务器用新 `run-id` 先执行 dry-run，确认任务中只有数据审计与三阶段训练，再正式启动。
+
+## 2026-07-19 - 修复单 episode 验证、过早停止与跨阶段错误晋级
+
+### Goal
+
+审计服务器已完成的一轮 `outputs`，判断其是否足以作为正式训练结果，并按最严格的可恢复训练合同修复验证抽样、早停、模型选择和 Stage 1→2→3 晋级。
+
+### Changed
+
+- 新增 `EpisodeBalancedValidationSampler`：按 episode identity 确定性排序，每个 episode 固定抽取一个窗口，消除 feature-store episode-contiguous 排列导致的 validation prefix 单轨迹偏差。
+- validation 同时记录 diagnostic 与 deployment 两种模式；deployment 固定使用 nominal action + predicted route，并新增 route position accuracy、boundary precision/recall/F1、schedule edit distance、action-distance gate 与双视角权重聚合。
+- early stopping 只读取 episode 数达标的 deployment `total_loss`；在默认 50,000-step 合同下，pre-schedule 记录不计 patience，最早从 step 35,000 开始。eligible 最优状态单独完整保存为 `checkpoint_best.pt`。
+- launcher 恢复 Stage 1 `100→1000` 阶梯与 readiness，Stage 1 best checkpoint 必须在至少 32 个 episode 上满足 H=4/8/16 相对 `copy_current` 平均改善≥10%、任一 horizon 不退化、nominal action gate 与双视角权重不塌缩，才允许进入 Stage 2。
+- Stage 2/3 checkpoint 记录并校验 predecessor 的 path-independent semantic identity；前序 best checkpoint 改变后，旧后续阶段不能静默 resume。
+- 更新正式 8 卡配置、单入口训练文档与活动实现合同；保留用户已写入 `docs/MTP_ONE_CLICK_TRAINING.md` 的服务器路径，未修改未跟踪的 equivalence 输出。
+
+### Commands Run
+
+```bash
+/Users/tt/miniconda3/envs/mowe/bin/python -m compileall -q mowe_wam scripts tests start_mtp.py
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -v
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -p 'test_feature_store.py' -v
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -p 'test_flow_torch_contracts.py' -v
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -p 'test_start_mtp.py' -v
+git diff --check
+```
+
+### Result
+
+- 受影响的 36 项专项测试全部通过：feature store 12 项、Flow Torch 19 项、launcher 5 项；compileall 与 `git diff --check` 通过。
+- 完整发现运行共 82 项，81 项通过；唯一失败是本地默认 `PYTHONPATH` 未包含 upstream OpenVLA-OFT 的 `prismatic`（加入 external 路径后还缺本机未安装的 `wandb`），发生在既有 real-loader dependency 测试。服务器 runbook 已要求安装该 pinned runtime；这不是本次训练控制改动的回归，但当前本机不能据此宣称 82/82。
+- 本轮只完成代码与本地合同验证，没有重新启动 GPU 训练，也没有生成新的 simulator success rate。
+
+### Issues
+
+- 旧输出的 Stage 1 质量门没有通过，且其 Stage 2/3 predecessor lineage 已不适用于修正版 best-checkpoint 晋级合同。
+- 修正后的真实 validation 运行成本会上升为每个 validation episode 每种模式一个窗口；必须在目标 8 卡节点实测吞吐与显存，不能用本地单元测试替代。
+
+### Next
+
+- 同步代码后使用新的 `run-id` 先 dry-run，再从 step 0 建立干净 lineage；保留旧 outputs 只作历史工程证据。
+- 训练时重点检查 step 35,000 之后的 `checkpoint_best.pt`、`early_stopping.json` 与 `stage1_quality_gate.json`，通过后才接受 Stage 2/3 输出。
 
 ## 最近关键变更索引
 

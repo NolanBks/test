@@ -76,8 +76,8 @@ future visual latent / delta + h_1...h_16
 | R25 | `[1,4,8,16]` 高维 targets 无法给 16 个 route positions 提供逐步状态 | 高 | 额外输出低维 `h_1...h_16`；简单 action+world+position query | `[B,16,128]` 有限且 route 不复制 global logits |
 | R26 | 双视角使冻结 OpenVLA 视觉计算与缓存压力增加 | 中高 | paired-frame LRU、一次 ordered multi-image forward、primary-only teacher target | 真实 7B K=8 optimizer step 无 OOM，cache/吞吐可接受 |
 | R27 | View Fusion 坍缩到单视角或权重成为无效装饰 | 高 | score-head 零初始化 0.5/0.5、语言/当前视觉条件、逐 skill/位置日志 | 权重有限且和为 1；primary/wrist mask 评估与 success-rate 共同验收 |
-| R28 | 单机 DDP 重复数据、状态漂移、rank 写冲突或节点 RAM/NCCL 死锁 | 高 | post-sidecar episode shard、rank-0 I/O/validation、effective-batch migration gate、per-rank RNG 与跨 rank 资源硬门禁 | 8 卡 shard union/互斥、base-lineage 2→4 resume、参数一致、GPU allocated/reserved<85%、cgroup working set<80%、无新增 OOM/死锁 |
-| R29 | 八套 TensorFlow/RLDS pipeline 在长训练中累积 anonymous memory，或 MP4 随机解码转化为 CPU/I/O 瓶颈 | 高 | RLDS 仅做离线转换；LeRobot 风格 canonical archive + memory-mapped MoWE feature store + map-style Dataset | 新旧路径等价；训练无 TF/视频解码/冻结 7B；8-rank anon/working-set 平台化且 oom_kill 不增加 |
+| R28 | 单机 DDP 重复数据、状态漂移、rank 写冲突或 NCCL 死锁 | 高 | post-sidecar episode shard、rank-0 I/O/validation、effective-batch migration gate、per-rank RNG；资源保护交由云平台 | 8 卡 shard union/互斥、base-lineage 2→4 resume、参数一致、完整三阶段 torchrun 可恢复 |
+| R29 | 八套 TensorFlow/RLDS pipeline 或 MP4 随机解码进入长训练热路径 | 高 | RLDS 仅做离线转换；LeRobot 风格 canonical archive + memory-mapped MoWE feature store + map-style Dataset | 新旧路径等价；训练进程不 import TF、不解码视频、不加载冻结 7B |
 | R30 | CALVIN 与 LIBERO 的相机、动作、控制频率和 episode 生命周期不一致，导致 adapter 静默错配或评测泄漏 | 高 | 独立 CALVIN adapter；显式坐标/缩放/旋转/gripper/queue contract；ABC→D 隔离 | round-trip 与 rollout smoke 通过，D 不进入训练统计，官方 evaluator 可复现 |
 | R31 | 原始 OpenVLA alias、feature store 与旧 OFT checkpoint identity 静默错配 | 高 | 固定 HF revision/权重 fingerprint；store/checkpoint/eval 全链绑定；禁止 backbone migration | 双视角 base smoke 通过，所有正式产物 identity 一致，旧 lineage 启动即失败 |
 
@@ -235,7 +235,7 @@ L_world_nominal = q * L_world
 
 单卡训练通过不代表八个独立 Python/TensorFlow pipeline 能安全长期运行。DDP 必须在 sidecar exact join 后且 frame transform 前按 episode shard，保持 `_traj_index` 不变；任意两个 rank 的 episode ID 重叠都视为数据契约失败。feature-store writer 预计算每 episode target-skill histogram，sampler 采用 deterministic suite/window/skill minimax 完整-episode 分配；audit 还必须证明各 rank target-skill counts 合并后与完整 train partition 一致，并报告 window/suite/skill imbalance，避免“episode 不重叠但罕见 expert 几乎只落在一个 rank”的隐性失衡。只有 rank 0 可写日志/checkpoint，并且 rank-0-only validation 必须绕过 DDP wrapper，其他 ranks 在边界等待。
 
-从单卡 checkpoint 迁移时，只有 backbone/store identity 完全相同、显式授权且 effective global batch 不变才允许恢复 optimizer/scheduler；该通用能力不能用于当前旧 OFT→原始 OpenVLA 的切换。当前主线必须直接在 world-size 8 上从 step 0 建立新 lineage。rank 0 保存 checkpoint 时必须先完整写临时文件再原子替换，避免抢占/故障中断损坏唯一的 `checkpoint_latest.pt`；sidecar 不可与 checkpoint generation 错配。长期运行前必须用 8 卡 25/100-step 实测记录每 rank RSS、GPU 峰值和共享 cgroup current/max；cgroup 达到 80% 直接失败，不能用宿主机总 RAM 代替容器上限。
+从单卡 checkpoint 迁移时，只有 backbone/store identity 完全相同、显式授权且 effective global batch 不变才允许恢复 optimizer/scheduler；该通用能力不能用于当前旧 OFT→原始 OpenVLA 的切换。当前主线必须直接在 world-size 8 上从 step 0 建立新 lineage。rank 0 保存 checkpoint 时必须先完整写临时文件再原子替换，避免抢占/故障中断损坏唯一的 `checkpoint_latest.pt`；sidecar 不可与 checkpoint generation 错配。按当前平台约束，`start_mtp.py` 不采集 RSS、cgroup、OOM event 或 GPU 显存 telemetry，资源配额与告警由云平台承担。
 
 same-stage resume 必须额外锁定完整 scheduler/optimization contract：`max_steps`、LR groups、AdamW、warmup/min-LR、loss weights、router/action-conditioning schedule、window contract、route mode 和 ablation 均不可改变；只允许修改 `stop_step` 与日志/保存频率。否则即使 optimizer state 能加载，也会在恢复后沿用新的 LambdaLR 或目标权重，形成不可审计的混合训练。
 
@@ -245,7 +245,7 @@ same-stage resume 必须额外锁定完整 scheduler/optimization contract：`ma
 
 正式长训练必须迁移到 `IMPLEMENTATION_PLAN.md` 10.2 节定义的两层数据结构：LeRobot 风格 canonical archive 负责保留原始多模态数据，MoWE feature store 负责训练热路径。由于第一版冻结 OpenVLA 且关闭 image augmentation，paired OpenVLA view features、instruction feature 和 DINO targets 可以离线缓存；训练时从 memory-mapped fixed-shape arrays 构造与现有 window contract 等价的 sample。
 
-截至 2026-07-17，feature-store writer、mmap Dataset、precomputed backbone、episode-aware sampler、sampler resume、结构/等价性审计与 soak 工具均已实现；feature pending episode 有原子索引/checksum，LIBERO resume filter 已在真实 RLDS 管线上证明位于 sidecar join 后、frame transform 前。rank 内采样采用 shard-aware block shuffle：先在 episode 内确定性混洗，再把同 shard 窗口组合成默认 256-window block 并混洗 block，避免 `max_open_feature_shards=2` 时逐样本跨 shard 导致 LRU 反复开关；策略与 block size 属于 checkpoint 恢复契约。canonical Parquet+MP4 writer 也已通过真实 PyArrow/FFmpeg 的小型 staging/resume/checksum 测试，并支持 primary/wrist 独立分辨率。DDP runtime 已在 setup、wrap、日志和 validation 边界强制 cgroup/GPU/OOM 资源门禁；soak 同时限制首尾增长与线性斜率，并逐采样检查必需指标，任一时刻缺少 cgroup v2 anon/working-set/oom/oom_kill 都会失败。`audit_long_training_readiness.py` 进一步要求 formal/count/checksum、人工审阅后的 rank imbalance limits、100-window equivalence、8-rank 10k-step soak、8-GPU runtime 和 checkpoint migration 证据同时存在，并输出绑定 resolved config/store/skill/checkpoint 的 attestation。训练入口允许同阶段 checkpoint lineage 累计最多 100-step bounded smoke，并把累计值写入 checkpoint；超过后必须验证 attestation，不能靠反复分段规避，旧 store、旧超参数或旧 checkpoint 的报告也不能复用。真实 LIBERO/CALVIN 全量双层转换、100-window 等价性和 8-rank continuous gates 仍未完成。因此 R29 仍为开放风险，不得仅凭本地测试关闭。
+截至 2026-07-19，feature-store writer、mmap Dataset、precomputed backbone、episode-aware sampler、sampler resume 与结构/等价性审计均已实现；feature pending episode 有原子索引/checksum，rank 内采用 shard-aware block shuffle，策略与 block size 属于 checkpoint 恢复契约。通用 runtime 的资源诊断工具仍保留给独立运维使用，但一键入口固定 `resource_monitoring=false`，不调用 soak、resource runtime audit 或 resource readiness。R29 因此由 formal store/checksum、100-window 等价性、无 TensorFlow/视频热路径、8-rank assignment 和真实长训练稳定性来约束；平台资源风险不由训练脚本闭环。
 
 关键边界：
 
@@ -319,18 +319,17 @@ CALVIN 被选定不代表当前已经可运行。代码已固定官方仓库 com
 - LIBERO evaluator 的 variable-prefix queue 在 8/4/短前缀后都会重新 query，query id 与执行 action 来源可追踪。
 - feature-store checkpoint 在 simulator 中显式重建 online frozen OpenVLA；评测入口在模型加载前强制 CLI backbone 与 checkpoint 内 `backbone_identifier` 一致。full-suite evaluator 只接受 Stage 3 joint 与 LIBERO source contract，并用绑定 checkpoint/suite/seeds 的逐 episode JSONL 恢复，禁止更换形状兼容但语义不同的 backbone，或在中断后混合不同实验记录。
 - Teacher cache metadata 与 checkpoint/transform 完全匹配。
-- 真实一个 optimizer step 无 NaN/OOM。
+- 真实一个 optimizer step loss/gradient 有限。
 - 日志包含 nominal/final action distance、world/delta loss、expert usage、router entropy 和 cache fingerprint。
 - 2-rank synthetic DDP 更新后参数 checksum 一致；2-rank 小型 Flow-WAM feature-store run 能保存 step N 并由新进程恢复到 N+1，且两 rank RNG/sampler cursor 与 rank-0 单写日志连续。8-rank episode shard 无交集且 union 完整，sidecar `_traj_index`/label 不因 sharding 改变。
 - rank 0 是唯一 JSONL/checkpoint writer；原始-backbone Stage 1 从 world-size 8 的 step 0 新建 lineage，不恢复旧 OFT-backbone 单卡 checkpoint。
 - 8 卡 step 0→2 smoke 和 2→4 resume 通过，八卡持续工作且 checkpoint step/scheduler/参数一致；随后通过 25-step 与 100-step 压力门禁。
-- 每 rank RSS、GPU peak、episode IDs 和 cgroup current/max 已记录；DDP 启动时 cgroup-v2 current/max/working-set/oom/oom_kill 与 CUDA total/peak 必须可测，否则 fail closed。GPU peak < 单卡容量 85%，cgroup < 80%，期间无新增 OOM kill 或 NCCL/TensorFlow/checkpoint 死锁。
 - `mowe_feature_store_v1` 的 episode/frame/window 数、suite partition、sidecar 与 source manifest fingerprints 与 RLDS source 完全一致；converter 保存 TFDS statistics 推导的 expected counts，finalize 与 actual counts 不一致时必须 `formal_training_ready=false`，结构文件存在或未使用 `--limit` 都不能替代完整性证明。
 - 至少 100 个真实窗口的新旧路径 OpenVLA views、language、DINO targets、完整 model outputs/losses 在声明 tolerance 内一致。
 - 正式长训练进程不 import TensorFlow、不解码 MP4、不加载冻结 OpenVLA 7B；RLDS 只在离线 converter/审计中出现。
 - feature-store manifest 必须绑定生成缓存使用的原始 OpenVLA repo id/revision/weight fingerprint、processor identity 和 DINO identifiers；训练配置未显式指定时从 manifest 写入 resolved config，显式指定不一致则启动失败。训练节点无需为了 identifier 校验保存 7B 权重副本。
 - episode-aware sampler 的八 rank episode 集合互斥、union 完整，assignment fingerprint 和 sampler cursor 可 checkpoint/resume。
-- CPU-only 与 GPU 8-rank continuous soak 中 `anon`/working set 在 warmup 后的绝对增长和每千 step 斜率均低于门限，`memory.events.oom/oom_kill` 不增加；该证据必须覆盖多次 reshuffle 和至少 500/1000 optimizer steps，且不得在 cgroup 指标缺失时通过。
+- `start_mtp.py --dry-run` 必须证明完整 Stage 1→2→3 命令链不包含 `/proc`、cgroup、RSS、OOM-event、GPU-memory、soak 或资源 readiness 操作；真实运行的资源保障由平台侧完成。
 
 ## 7. 论文用语边界
 

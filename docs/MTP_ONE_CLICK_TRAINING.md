@@ -2,17 +2,19 @@
 
 `start_mtp.py` 是面向只能提交一个 Python 入口的 MTP/云训练平台的正式编排器。它会按 fail-closed 顺序自动完成：
 
-1. 路径、8 GPU、cgroup v2 预检。
+1. 路径与 8 GPU 数量预检。
 2. RLDS/skill config、formal feature-store checksum 与 8-rank assignment 审计。
 3. 100-window raw/cache 等价性审计。
-4. 同一节点、同一 boot、同一 cgroup 的 8-rank feature-store soak 和 8-GPU runtime audit。
-5. Stage 1：`0→2→25→100→最多 50000`，在 step 100 签发 checkpoint-bound readiness，之后按 validation `total_loss` 自动早停。
-6. Stage 2：`0→100→最多 50000`，使用 Stage 1 最终 checkpoint 初始化，签发 Stage 2 readiness，之后使用相同的 loss 早停规则。
-7. Stage 3：`0→100→最多 50000`，使用 Stage 2 最终 checkpoint 初始化并签发 Stage 3 readiness，之后使用相同的 loss 早停规则。
+4. Stage 1：`0→2→25→100→1000→最多 50000`，保持同一训练合同精确恢复。
+5. Stage 1 结束后，deployment validation 必须在至少 32 个不同 episode 上证明 H=4/8/16 future predictor 平均优于 `copy_current` 至少 10%，且任一 horizon 不得更差；失败时禁止进入 Stage 2。
+6. Stage 2：`0→100→最多 50000`，使用通过质量门禁的 Stage 1 checkpoint 初始化。
+7. Stage 3：`0→100→最多 50000`，使用 Stage 2 checkpoint 初始化。
 
-三个阶段默认每 500 步验证一次；至少训练 5000 步后，如果最佳 validation `total_loss` 连续 5 次没有下降至少 `1e-4`，当前阶段保存 checkpoint 并正常结束，启动下一阶段。若一直未触发早停，则在 50000 步结束。copy-current、route accuracy、expert improvement、boundary F1 等指标不再作为阶段晋级条件。
+三个阶段默认每 500 步验证一次。feature-store 验证按 episode identity 确定性均衡取样，每个 validation episode 固定一个窗口，并同时输出 diagnostic（GT action/oracle route）与 deployment（nominal action/predicted route）记录。早停只读取 deployment `total_loss`，并且要等 nominal-action 与 Stage 3 predicted-route 调度完成（默认 50000-step 合同下最早 step 35000）后才开始累计 patience。最佳 deployment checkpoint 单独保存为 `checkpoint_best.pt`，`checkpoint_latest.pt` 继续承担精确恢复。
 
-任何审计、readiness、数据/分布式正确性或资源门槛失败时，脚本仍立即停止并保留 checkpoint、报告和日志，不会自动放宽阈值。
+任何数据审计、训练/验证质量、checkpoint 或分布式训练错误都会立即停止并保留 checkpoint、报告和日志，不会自动放宽阈值。
+
+该一键入口不读取 `/proc`、cgroup、宿主机内存、进程 RSS、OOM event 或 GPU 显存统计，也不启动 soak、资源 runtime audit 或资源 readiness。平台资源观察与配额保护由云平台自身承担，不属于训练脚本流程。
 
 ## 1. 新服务器必须准备的内容
 
@@ -25,69 +27,136 @@
 - `facebook/dinov2-small` snapshot。
 - `cot_file.json` skill sidecar。
 
-feature store 可以挂载到新的绝对路径。OpenVLA 使用不可变 revision 与权重指纹校验；DINO 的新服务器路径由重新运行的 100-window 等价性审计进行实质验证。旧服务器生成的 equivalence、soak、runtime/readiness 报告不能直接跨路径/节点复用。
+feature store 可以挂载到新的绝对路径。OpenVLA 使用不可变 revision 与权重指纹校验；DINO 的新服务器路径由重新运行的 100-window 等价性审计进行实质验证。脚本在正式启动时仅通过 PyTorch 核对 8 张 CUDA 设备可见，不执行系统资源采样。
 
-正式运行前检查：
+## 2. 本次重新训练：直接按此执行
 
-```bash
-nvidia-smi -L
-python -c 'import torch; print(torch.cuda.device_count())'
-test -f /sys/fs/cgroup/cgroup.controllers
-test -f /sys/fs/cgroup/memory.current
-test -f /sys/fs/cgroup/memory.max
-test -f /sys/fs/cgroup/memory.events
+旧的 `libero_original_openvla_h16_v1` 已经受单 episode validation 和过早停止影响。本次必须创建全新的 lineage：
+
+```text
+libero_original_openvla_h16_v2
 ```
 
-GPU 数必须是 8，cgroup v2 文件必须存在。
+保留旧 `v1` 目录作为历史证据，不要删除、覆盖、移动或复制其中的 Stage 1/2/3 checkpoint 到 `v2`。开始前先把当前修正版仓库完整同步到服务器；后续 dry-run、正式启动和中断恢复必须始终使用下面完全相同的路径、`run-id` 和训练参数。
 
-如果平台不向容器开放 `/proc` 或 cgroup、且无法取得该权限，可在启动命令追加：
-
-```bash
---disable-system-monitoring
-```
-
-该显式降级模式不会读取 cgroup、`/proc` boot/cgroup identity 或宿主机内存/OOM 指标；仍强制检查 8 卡 CUDA、NCCL rank/GPU 绑定、GPU 显存、数据完整性和 checkpoint 合同。报告会标为降级资源证据，不能与带 cgroup 监控的正式节点证据混用。
-
-## 2. 推荐启动命令
+### 2.1 先执行 dry-run
 
 先用 `--dry-run` 检查所有路径和将要执行的命令；dry-run 不要求当前机器有 8 张 GPU：
 
 ```bash
-cd /NEW_PATH/MoWE
+cd /home/ma-user/work/algorithm/chaoxintao_2/MoWE/MoWE
 
 python start_mtp.py \
-  --repo-root /NEW_PATH/MoWE \
-  --data-root /NEW_PATH/libero_cot_rlds \
-  --feature-store /NEW_PATH/mowe_store/libero_h16_formal \
-  --openvla-checkpoint /NEW_PATH/models/openvla-7b \
+  --repo-root /home/ma-user/work/algorithm/chaoxintao_2/MoWE/MoWE \
+  --data-root /home/ma-user/work/algorithm/chaoxintao_2/MoWE/libero_cot_rlds \
+  --feature-store /home/ma-user/work/algorithm/chaoxintao_2/MoWE/mowe_store/libero_h16_formal_4090 \
+  --openvla-checkpoint /home/ma-user/work/algorithm/chaoxintao_2/MoWE/openvla-7b \
   --openvla-revision 47a0ec7fc4ec123775a391911046cf33cf9ed83f \
-  --dino-checkpoint /NEW_PATH/models/facebook-dinov2-small \
-  --skill-sidecar /NEW_PATH/libero_cot_rlds/cot_file.json \
-  --run-root-dir /NEW_PATH/outputs \
-  --run-id libero_original_openvla_h16_v1 \
+  --dino-checkpoint /home/ma-user/work/algorithm/chaoxintao_2/MoWE/facebook-dinov2-small \
+  --skill-sidecar /home/ma-user/work/algorithm/chaoxintao_2/MoWE/libero_cot_rlds/cot_file.json \
+  --run-root-dir /home/ma-user/work/algorithm/chaoxintao_2/MoWE/outputs \
+  --run-id libero_original_openvla_h16_v2 \
   --dry-run
 ```
 
-确认输出正确后，删除最后一行的 `--dry-run`，使用相同参数正式启动：
+dry-run 返回码必须为 0。随后执行以下检查；它只读取 launcher 生成的 JSON，不采集系统资源：
 
 ```bash
-python start_mtp.py \
-  --repo-root /NEW_PATH/MoWE \
-  --data-root /NEW_PATH/libero_cot_rlds \
-  --feature-store /NEW_PATH/mowe_store/libero_h16_formal \
-  --openvla-checkpoint /NEW_PATH/models/openvla-7b \
-  --openvla-revision 47a0ec7fc4ec123775a391911046cf33cf9ed83f \
-  --dino-checkpoint /NEW_PATH/models/facebook-dinov2-small \
-  --skill-sidecar /NEW_PATH/libero_cot_rlds/cot_file.json \
-  --run-root-dir /NEW_PATH/outputs \
-  --run-id libero_original_openvla_h16_v1
+python - <<'PY'
+import json
+from pathlib import Path
+
+run = Path("/home/ma-user/work/algorithm/chaoxintao_2/MoWE/outputs/libero_original_openvla_h16_v2")
+state = json.loads((run / "launcher_state.json").read_text())
+tasks = state["tasks"]
+required = {
+    "feature_store_audit",
+    "feature_equivalence",
+    "ddp_stage1_0_2",
+    "ddp_stage1_2_25",
+    "ddp_stage1_25_100",
+    "ddp_stage1_100_1000",
+    "ddp_stage1_1000_50000",
+    "stage1_quality_gate",
+    "ddp_stage2_0_100",
+    "ddp_stage2_100_50000",
+    "ddp_stage3_0_100",
+    "ddp_stage3_100_50000",
+}
+missing = sorted(required - set(tasks))
+assert not missing, f"dry-run 缺少任务: {missing}"
+assert all(tasks[name]["status"] == "dry_run" for name in required)
+
+for stage in ("stage1", "stage2", "stage3"):
+    cfg = json.loads((run / "configs" / f"{stage}.json").read_text())
+    distributed = cfg["training"]["distributed"]
+    assert distributed["resource_monitoring"] is False
+    assert "memory_guard_fraction" not in distributed
+    assert "gpu_memory_guard_fraction" not in distributed
+
+commands = "\n".join(
+    " ".join(map(str, task.get("command", []))) for task in tasks.values()
+).lower()
+for forbidden in (
+    "soak_mowe_feature_store",
+    "audit_ddp_runtime",
+    "audit_long_training_readiness",
+    "long-run-readiness",
+    "system-monitoring",
+    "cgroup",
+    "memory-guard",
+    "gpu-memory",
+):
+    assert forbidden not in commands, forbidden
+
+print("dry-run contract OK: v2 complete Stage 1 -> Stage 2 -> Stage 3, resource telemetry disabled")
+PY
 ```
+
+预期最后打印：
+
+```text
+dry-run contract OK: v2 complete Stage 1 -> Stage 2 -> Stage 3, resource telemetry disabled
+```
+
+### 2.2 正式启动
+
+上述检查通过后，删除 dry-run 命令最后一行的 `--dry-run`，其他参数保持完全相同：
+
+```bash
+cd /home/ma-user/work/algorithm/chaoxintao_2/MoWE/MoWE
+
+python start_mtp.py \
+  --repo-root /home/ma-user/work/algorithm/chaoxintao_2/MoWE/MoWE \
+  --data-root /home/ma-user/work/algorithm/chaoxintao_2/MoWE/libero_cot_rlds \
+  --feature-store /home/ma-user/work/algorithm/chaoxintao_2/MoWE/mowe_store/libero_h16_formal_4090 \
+  --openvla-checkpoint /home/ma-user/work/algorithm/chaoxintao_2/MoWE/openvla-7b \
+  --openvla-revision 47a0ec7fc4ec123775a391911046cf33cf9ed83f \
+  --dino-checkpoint /home/ma-user/work/algorithm/chaoxintao_2/MoWE/facebook-dinov2-small \
+  --skill-sidecar /home/ma-user/work/algorithm/chaoxintao_2/MoWE/libero_cot_rlds/cot_file.json \
+  --run-root-dir /home/ma-user/work/algorithm/chaoxintao_2/MoWE/outputs \
+  --run-id libero_original_openvla_h16_v2
+```
+
+不要添加 `--disable-system-monitoring`、soak、memory guard 或 readiness 参数；当前一键入口已经固定不执行这些操作。
+
+### 2.3 中断后恢复
+
+如果平台中断、进程退出或任务需要重新提交，直接再次执行上面的正式启动命令，不要添加 `--dry-run`，也不要修改任何参数。脚本会从 `v2` 当前 stage 的 `checkpoint_latest.pt` 精确恢复；不要手工指定旧 `v1` checkpoint。
+
+只有以下情况应更换为新的 `run-id`，不能在 `v2` 上恢复：
+
+- 修改 feature store、OpenVLA revision/权重、DINO、skill sidecar 或训练配置。
+- 修改 `stage*-max-steps`、optimizer、学习率、solver、seed、window 或 routing schedule。
+- 希望从头重新建立另一条实验 lineage。
 
 如果平台要求显式 Python 环境，可增加：
 
 ```bash
 --python /NEW_PATH/conda/envs/mowe/bin/python
 ```
+
+若增加该参数，dry-run、首次正式启动和后续恢复三次都必须使用同一个 Python 路径。
 
 ## 3. 必须传入的参数
 
@@ -119,12 +188,11 @@ python start_mtp.py \
 --early-stop-min-delta 1e-4
 --early-stop-patience 5
 --early-stop-min-steps 5000
+--min-validation-episodes 32
 --flow-solver-steps 4
 --equivalence-samples 100
---soak-steps 10000
 --long-save-freq 500
 --long-log-freq 10
---disable-system-monitoring  # 仅当平台没有系统资源指标访问权限时加入
 ```
 
 查看全部参数及脚本内注释：
@@ -133,7 +201,7 @@ python start_mtp.py \
 python start_mtp.py --help
 ```
 
-`--early-stop-min-delta` 越大越容易认为没有改善，`--early-stop-patience` 越小越容易提前结束，`--early-stop-min-steps` 控制最早结束 step。建议先保留上述默认值。数据等价性容差、imbalance ratio、内存增长/斜率和 GPU/cgroup guard 不建议放宽。
+`--early-stop-min-steps` 是绝对下限；launcher 还会自动把有效下限提高到 deployment schedule 完成 step，因此默认 50000-step 合同实际不会早于 step 35000。数据等价性容差、Stage 1 质量门槛、episode 数和 imbalance ratio 不建议放宽。
 
 ## 5. 自动恢复
 
@@ -149,7 +217,7 @@ python start_mtp.py --help
 
 - 跳过已经完成的 checkpoint step。
 - 从当前 stage 的 `checkpoint_latest.pt` same-stage resume。
-- 在需要继续长训练时，针对当前最新 checkpoint 重新签发 readiness。
+- 检查 Stage 2/3 保存的 predecessor identity；若前一阶段 checkpoint 已改变，拒绝把旧后续阶段静默续接到新 lineage。
 - 不会从单卡 checkpoint 初始化正式 Stage 1。
 
 不要在恢复时修改 `stage*-max-steps`、solver、seed、feature store、skill config 或模型 identity。只移动服务器路径时，仍需使用相同内容的 store/model/data，并让脚本重新生成跨服务器证据。
@@ -168,13 +236,11 @@ python start_mtp.py --help
   reports/
     feature_store_audit.json
     feature_equivalence_100.json
-    feature_store_soak_8rank.json
-    ddp_runtime_8gpu.json
-    readiness_stage*_step*.json
     *.log
   ddp8/
     stage1/
       checkpoint_latest.pt
+      checkpoint_best.pt
       train_log.jsonl
       validation_log.jsonl
       early_stopping.json
@@ -186,16 +252,14 @@ python start_mtp.py --help
 
 ## 7. 脚本会主动停止的情况
 
-- 不是 8 张可见 GPU，或 rank/GPU 绑定不完整。
-- 缺少 cgroup v2 指标。
+- 不是 8 张可见 GPU，或 torchrun/DDP 启动失败。
 - formal store 不完整、checksum 失败或 8-rank assignment 不完整。
 - raw/cache equivalence 失败。
-- soak 出现 OOM/OOM-kill 或内存增长/斜率超标。
-- readiness 与 store/config/checkpoint/node identity 不匹配。
 - checkpoint stage/step、same-stage schedule 或 predecessor 不合法。
 - loss/gradient 或验证日志出现 NaN/Inf。
+- validation 没有覆盖至少 32 个不同 episode，或 Stage 1 deployment future 质量门禁失败。
 
-copy-current、router/expert promotion 和 boundary 指标不会再阻止阶段切换。`early_stopping.json` 中 `reason=validation_loss_plateau` 表示 loss 平台期正常结束，`reason=max_steps` 表示跑满 50000 步；两者都不是错误退出。
+Stage 1 的 `copy_current` 质量门禁会阻止阶段切换；route accuracy、expert improvement 和 boundary 指标继续作为 Stage 2/3 诊断证据。`early_stopping.json` 中 `reason=validation_loss_plateau` 表示调度完成后的 deployment loss 平台期，`reason=max_steps` 表示跑满 50000 步。
 
 这些停止条件是训练合同的一部分，不应通过更换 `run-id` 或放宽参数规避。
 

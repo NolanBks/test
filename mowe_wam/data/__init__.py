@@ -35,6 +35,7 @@ from mowe_wam.data.visual_target_cache import (
 from mowe_wam.data.feature_store import (
     FEATURE_STORE_FORMAT,
     EpisodeAwareDistributedSampler,
+    EpisodeBalancedValidationSampler,
     MoWEFeatureStoreWriter,
     MoWEFeatureWindowDataset,
     audit_feature_store,
@@ -57,6 +58,7 @@ __all__ = [
     "CANONICAL_ARCHIVE_FORMAT",
     "ExpertSkillSidecar",
     "EpisodeAwareDistributedSampler",
+    "EpisodeBalancedValidationSampler",
     "FEATURE_STORE_FORMAT",
     "LABEL_VERSION",
     "LatentWAMCollator",

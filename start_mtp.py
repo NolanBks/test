@@ -3,20 +3,18 @@
 
 This file is intentionally self-contained so managed training platforms can
 launch the complete MoWE pipeline through one Python entrypoint. Re-running the
-same command resumes from the newest stage checkpoint and regenerates any
-checkpoint-bound readiness attestation that is no longer current.
+same command resumes from the newest stage checkpoint. The launcher performs no
+host, container, process-memory, OOM-event, or GPU-memory telemetry.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
 import signal
 import shlex
-import socket
 import subprocess
 import sys
 from collections import Counter
@@ -59,68 +57,6 @@ def same_path(left: Any, right: Path) -> bool:
     if left in {None, ""}:
         return False
     return Path(str(left)).expanduser().resolve() == right.expanduser().resolve()
-
-
-def current_node_identity() -> dict[str, Any]:
-    if os.environ.get("MOWE_DISABLE_SYSTEM_MONITORING", "").strip().lower() in {
-        "1", "true", "yes", "on"
-    }:
-        return {"system_monitoring_disabled": True}
-    boot = Path("/proc/sys/kernel/random/boot_id")
-    membership = Path("/proc/self/cgroup")
-    rendered = membership.read_text(encoding="utf-8").strip() if membership.exists() else None
-    return {
-        "hostname": socket.gethostname(),
-        "boot_id": boot.read_text(encoding="utf-8").strip() if boot.exists() else None,
-        "cgroup_membership_sha256": (
-            hashlib.sha256(rendered.encode("utf-8")).hexdigest() if rendered else None
-        ),
-    }
-
-
-def node_report_is_current(
-    path: Path,
-    *,
-    world_size: int,
-    store: Path | None = None,
-    expected_limits: dict[str, float] | None = None,
-) -> bool:
-    if not path.is_file():
-        return False
-    try:
-        report = load_json(path)
-        runtime = report.get("runtime_identity", {})
-        node = runtime.get("node", {})
-        current = current_node_identity()
-        monitoring_disabled = current.get("system_monitoring_disabled") is True
-        identity_matches = (
-            bool(report.get("passed", True))
-            and int(runtime.get("rank_count", 0)) == world_size
-            and (
-                node.get("system_monitoring_disabled") is True
-                if monitoring_disabled
-                else all(node.get(key) == current.get(key) for key in current)
-            )
-        )
-        if not identity_matches:
-            return False
-        if store is not None and not same_path(report.get("store"), store):
-            return False
-        if expected_limits is not None:
-            observed = report.get("limits") or report.get("resource_guard_thresholds") or {}
-            if any(
-                not math.isclose(
-                    float(observed.get(name, float("inf"))),
-                    float(value),
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
-                )
-                for name, value in expected_limits.items()
-            ):
-                return False
-        return True
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return False
 
 
 def report_matches_store(path: Path, store: Path, *, kind: str, samples: int = 0) -> bool:
@@ -175,6 +111,12 @@ def checkpoint_metadata(path: Path, expected_stage: str | None = None) -> dict[s
     return metadata
 
 
+def checkpoint_predecessor_identity(metadata: dict[str, Any]) -> dict[str, Any]:
+    from mowe_wam.training.flow_runtime import checkpoint_semantic_identity
+
+    return checkpoint_semantic_identity(metadata)
+
+
 def jsonl_rows(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
@@ -191,6 +133,98 @@ def finite_tree(value: Any) -> bool:
     if isinstance(value, list):
         return all(finite_tree(item) for item in value)
     return not isinstance(value, float) or math.isfinite(value)
+
+
+def stage1_quality_gate(
+    records: list[dict[str, Any]],
+    *,
+    required_average_improvement: float = 0.10,
+    required_min_horizon_improvement: float = 0.0,
+    min_unique_episodes: int = 32,
+    min_action_distance_gate: float = 0.10,
+    validation_step: int | None = None,
+) -> dict[str, Any]:
+    """Evaluate the latest deployment-like Stage 1 mechanism evidence."""
+
+    eligible = [
+        record
+        for record in records
+        if record.get("stage") == "nominal_flow_pretrain"
+        and record.get("validation_mode") == "deployment"
+        and (
+            validation_step is None
+            or int(record.get("step", -1)) == int(validation_step)
+        )
+    ]
+    if not eligible:
+        return {
+            "format": "mowe_stage1_quality_gate_v2",
+            "passed": False,
+            "errors": ["deployment_validation_missing"],
+        }
+    latest = max(eligible, key=lambda record: int(record.get("step", -1)))
+    errors = []
+    improvements = {}
+    for horizon in (4, 8, 16):
+        metrics = latest.get("future_horizon_metrics", {}).get(str(horizon), {})
+        predicted = metrics.get("smooth_l1")
+        baseline = metrics.get("current_copy_smooth_l1")
+        if not isinstance(predicted, (int, float)) or not isinstance(
+            baseline, (int, float)
+        ) or not math.isfinite(float(predicted)) or not math.isfinite(float(baseline)):
+            errors.append(f"horizon_{horizon}_metrics_missing")
+            continue
+        if float(baseline) <= 0:
+            errors.append(f"horizon_{horizon}_copy_baseline_nonpositive")
+            continue
+        improvements[str(horizon)] = 1.0 - float(predicted) / float(baseline)
+    average_improvement = (
+        sum(improvements.values()) / len(improvements) if improvements else float("-inf")
+    )
+    if len(improvements) != 3:
+        errors.append("required_horizons_incomplete")
+    if average_improvement < required_average_improvement:
+        errors.append("average_copy_current_improvement_below_threshold")
+    if improvements and min(improvements.values()) < required_min_horizon_improvement:
+        errors.append("one_or_more_horizons_worse_than_copy_current")
+    unique_episodes = int(latest.get("unique_episodes", 0))
+    if unique_episodes < min_unique_episodes:
+        errors.append("insufficient_unique_validation_episodes")
+    if latest.get("sampling_contract") != "episode_balanced_deterministic_v1":
+        errors.append("validation_sampling_contract_mismatch")
+    deployment = latest.get("deployment_metrics", {})
+    action_gate = float(deployment.get("mean_nominal_action_distance_gate", 0.0))
+    if not math.isfinite(action_gate) or action_gate < min_action_distance_gate:
+        errors.append("nominal_action_distance_gate_collapsed")
+    view_weights = deployment.get("current_view_weights_mean", [])
+    view_weights_valid = (
+        len(view_weights) == 2
+        and all(isinstance(value, (int, float)) and math.isfinite(value) for value in view_weights)
+        and math.isclose(sum(view_weights), 1.0, rel_tol=0.0, abs_tol=1e-4)
+        and min(view_weights) >= 0.05
+    )
+    if not view_weights_valid:
+        errors.append("view_weights_invalid_or_collapsed")
+    return {
+        "format": "mowe_stage1_quality_gate_v2",
+        "passed": not errors,
+        "stage": "nominal_flow_pretrain",
+        "validation_step": int(latest.get("step", -1)),
+        "validation_mode": "deployment",
+        "unique_episodes": unique_episodes,
+        "sampling_contract": latest.get("sampling_contract"),
+        "fractional_improvement_over_copy_current": improvements,
+        "average_improvement": average_improvement,
+        "required_average_improvement": float(required_average_improvement),
+        "required_min_horizon_improvement": float(
+            required_min_horizon_improvement
+        ),
+        "mean_nominal_action_distance_gate": action_gate,
+        "minimum_action_distance_gate": float(min_action_distance_gate),
+        "current_view_weights_mean": view_weights,
+        "view_weights_valid_and_not_collapsed": view_weights_valid,
+        "errors": errors,
+    }
 
 
 class Launcher:
@@ -216,7 +250,6 @@ class Launcher:
                 "CUDA_VISIBLE_DEVICES": args.cuda_devices,
                 "TOKENIZERS_PARALLELISM": "false",
                 "TF_CPP_MIN_LOG_LEVEL": "2",
-                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
                 "PYTHONUNBUFFERED": "1",
                 "PYTHONPATH": os.pathsep.join(
                     filter(
@@ -230,9 +263,11 @@ class Launcher:
                 ),
             }
         )
-        if args.disable_system_monitoring:
-            self.env["MOWE_DISABLE_SYSTEM_MONITORING"] = "1"
-            os.environ["MOWE_DISABLE_SYSTEM_MONITORING"] = "1"
+        # The one-click workflow intentionally performs no host/container/GPU
+        # resource telemetry. Keep the environment guard enabled as a second
+        # line of defense for imported training utilities.
+        self.env["MOWE_DISABLE_SYSTEM_MONITORING"] = "1"
+        os.environ["MOWE_DISABLE_SYSTEM_MONITORING"] = "1"
 
     def save_state(self) -> None:
         self.state["updated_at"] = utc_now()
@@ -344,9 +379,6 @@ class Launcher:
             self.args.stage3_config,
             "scripts/audit_mowe_feature_store.py",
             "scripts/audit_feature_store_equivalence.py",
-            "scripts/soak_mowe_feature_store.py",
-            "scripts/audit_ddp_runtime.py",
-            "scripts/audit_long_training_readiness.py",
         ):
             if not (self.repo / relative).is_file():
                 raise FileNotFoundError(f"Required repository file is missing: {relative}")
@@ -364,21 +396,27 @@ class Launcher:
             raise ValueError("Every formal stage must contain at least the 100-step smoke gate.")
         if self.args.validation_freq < 1:
             raise ValueError("--validation-freq must be positive.")
-        if self.args.early_stop_min_delta < 0:
+        if not math.isfinite(self.args.early_stop_min_delta) or self.args.early_stop_min_delta < 0:
             raise ValueError("--early-stop-min-delta must be non-negative.")
         if self.args.early_stop_patience < 1:
             raise ValueError("--early-stop-patience must be positive.")
         if self.args.early_stop_min_steps < 100:
             raise ValueError("--early-stop-min-steps must be at least 100.")
-        if not self.args.dry_run and not self.args.disable_system_monitoring:
-            for path in (
-                Path("/sys/fs/cgroup/cgroup.controllers"),
-                Path("/sys/fs/cgroup/memory.current"),
-                Path("/sys/fs/cgroup/memory.max"),
-                Path("/sys/fs/cgroup/memory.events"),
-            ):
-                if not path.is_file():
-                    raise RuntimeError(f"Required cgroup-v2 metric is unavailable: {path}")
+        if self.args.min_validation_episodes < 2:
+            raise ValueError("--min-validation-episodes must be at least 2.")
+        if (
+            not math.isfinite(self.args.stage1_quality_average_improvement)
+            or self.args.stage1_quality_average_improvement < 0
+        ):
+            raise ValueError("--stage1-quality-average-improvement must be non-negative.")
+        if not math.isfinite(self.args.stage1_quality_min_horizon_improvement):
+            raise ValueError("--stage1-quality-min-horizon-improvement must be finite.")
+        if (
+            not math.isfinite(self.args.stage1_quality_min_action_gate)
+            or self.args.stage1_quality_min_action_gate <= 0
+        ):
+            raise ValueError("--stage1-quality-min-action-gate must be positive.")
+        if not self.args.dry_run:
             probe = subprocess.run(
                 [
                     self.python,
@@ -398,7 +436,13 @@ class Launcher:
         self.report_root.mkdir(parents=True, exist_ok=True)
         self.stage_root.mkdir(parents=True, exist_ok=True)
         self.prepare_runtime_configs()
-        self.record("preflight", status="complete" if not self.args.dry_run else "dry_run", node=current_node_identity())
+        self.record(
+            "preflight",
+            status="complete" if not self.args.dry_run else "dry_run",
+            world_size=self.args.world_size,
+            cuda_devices=list(self.gpus),
+            resource_monitoring=False,
+        )
 
     def prepare_runtime_configs(self) -> None:
         """Freeze inherited configs and launcher overrides into run-local JSON files."""
@@ -433,28 +477,60 @@ class Launcher:
                 }
             )
             validation = config.setdefault("validation", {})
+            schedule_completion_ratio = float(
+                config.get("action_condition", {}).get("nominal_end_ratio", 0.70)
+            )
+            if name == "stage3":
+                schedule_completion_ratio = max(
+                    schedule_completion_ratio,
+                    float(
+                        config.get("router", {}).get(
+                            "predicted_route_end_ratio", 0.70
+                        )
+                    ),
+                )
+            effective_early_stop_min_steps = max(
+                self.args.early_stop_min_steps,
+                math.ceil(schedule_completion_ratio * max_steps),
+            )
             validation.update(
                 {
                     "enabled": True,
                     "eval_freq": self.args.validation_freq,
+                    "num_batches": None,
+                    "windows_per_episode": 1,
+                    "min_unique_episodes": self.args.min_validation_episodes,
+                    "modes": ["diagnostic", "deployment"],
                     "early_stopping": {
                         "enabled": True,
                         "metric": "total_loss",
                         "min_delta": self.args.early_stop_min_delta,
                         "patience": self.args.early_stop_patience,
-                        "min_steps": self.args.early_stop_min_steps,
+                        "min_steps": effective_early_stop_min_steps,
+                        "validation_mode": "deployment",
+                        "require_schedule_completion": True,
                     },
                 }
             )
-            config["training"]["distributed"].update(
-                {
-                    "enabled": "auto",
-                    "backend": "nccl",
-                    "require_cgroup_metrics": not self.args.disable_system_monitoring,
-                    "memory_guard_fraction": self.args.memory_guard_fraction,
-                    "gpu_memory_guard_fraction": self.args.gpu_memory_guard_fraction,
-                }
-            )
+            inherited_distributed = config["training"].get("distributed", {})
+            config["training"]["distributed"] = {
+                "enabled": "auto",
+                "backend": "nccl",
+                "timeout_seconds": int(
+                    inherited_distributed.get("timeout_seconds", 1800)
+                ),
+                "broadcast_buffers": bool(
+                    inherited_distributed.get("broadcast_buffers", False)
+                ),
+                "find_unused_parameters": bool(
+                    inherited_distributed.get("find_unused_parameters", False)
+                ),
+                "resource_monitoring": False,
+            }
+            config["long_run_readiness"] = {
+                "report_path": None,
+                "mode": "disabled_no_resource_monitoring",
+            }
             destination = config_root / f"{name}.json"
             atomic_json(destination, config)
             self.runtime_configs[name] = str(destination)
@@ -539,6 +615,13 @@ class Launcher:
                     "--output", feature_report,
                 ),
             )
+        else:
+            self.record(
+                "feature_store_audit",
+                status="complete",
+                reused=True,
+                report=str(feature_report),
+            )
         equivalence_report = self.report_root / "feature_equivalence_100.json"
         evidence_inputs = self.state.get("static_evidence_inputs")
         current_inputs = {
@@ -582,69 +665,14 @@ class Launcher:
             )
             self.state["static_evidence_inputs"] = current_inputs
             self.save_state()
+        else:
+            self.record(
+                "feature_equivalence",
+                status="complete",
+                reused=True,
+                report=str(equivalence_report),
+            )
         return skill_config
-
-    def ensure_node_evidence(self) -> None:
-        soak_report = self.report_root / "feature_store_soak_8rank.json"
-        if self.args.force_node_audits or not node_report_is_current(
-            soak_report,
-            world_size=self.args.world_size,
-            store=self.args.feature_store,
-                expected_limits=None if self.args.disable_system_monitoring else {
-                "max_anon_growth_mib": self.args.max_anon_growth_mib,
-                "max_working_set_growth_mib": self.args.max_working_set_growth_mib,
-                "max_anon_slope_mib_per_1k_steps": self.args.max_anon_slope_mib,
-                "max_working_set_slope_mib_per_1k_steps": self.args.max_working_set_slope_mib,
-            },
-        ):
-            self.run(
-                "feature_store_soak_8rank",
-                self.torchrun_command(
-                    "scripts/soak_mowe_feature_store.py",
-                    "--store", self.args.feature_store,
-                    "--steps", self.args.soak_steps,
-                    "--warmup-steps", self.args.soak_warmup_steps,
-                    "--sample-every", self.args.soak_sample_every,
-                    "--max-anon-growth-mib", self.args.max_anon_growth_mib,
-                    "--max-working-set-growth-mib", self.args.max_working_set_growth_mib,
-                    "--max-anon-slope-mib-per-1k-steps", self.args.max_anon_slope_mib,
-                    "--max-working-set-slope-mib-per-1k-steps", self.args.max_working_set_slope_mib,
-                    "--max-open-feature-shards", 2,
-                    "--shuffle-block-size", self.args.shuffle_block_size,
-                    *(
-                        ["--disable-system-monitoring"]
-                        if self.args.disable_system_monitoring else []
-                    ),
-                    "--output", soak_report,
-                ),
-            )
-        runtime_report = self.report_root / "ddp_runtime_8gpu.json"
-        if self.args.force_node_audits or not node_report_is_current(
-            runtime_report,
-            world_size=self.args.world_size,
-                expected_limits={
-                    "gpu_peak_allocated_fraction": self.args.gpu_memory_guard_fraction,
-                    **(
-                        {} if self.args.disable_system_monitoring else {
-                            "cgroup_working_set_fraction": self.args.memory_guard_fraction,
-                        }
-                    ),
-                },
-        ):
-            self.run(
-                "ddp_runtime_8gpu",
-                self.torchrun_command(
-                    "scripts/audit_ddp_runtime.py",
-                    "--config", self.runtime_configs["stage1"],
-                    "--memory-guard-fraction", self.args.memory_guard_fraction,
-                    "--gpu-memory-guard-fraction", self.args.gpu_memory_guard_fraction,
-                    *(
-                        ["--disable-system-monitoring"]
-                        if self.args.disable_system_monitoring else []
-                    ),
-                    "--output", runtime_report,
-                ),
-            )
 
     def common_train_args(self, config: str, output_dir: Path, max_steps: int, stop_step: int) -> list[Any]:
         return [
@@ -662,42 +690,6 @@ class Launcher:
             "--precision", "bf16",
         ]
 
-    def issue_readiness(
-        self, stage_name: str, config: str, checkpoint: Path, *, step_hint: int | None = None
-    ) -> Path:
-        metadata = checkpoint_metadata(checkpoint) or self.virtual_checkpoints.get(str(checkpoint))
-        if metadata is None:
-            if not self.args.dry_run or step_hint is None:
-                raise RuntimeError(f"Cannot issue readiness without a checkpoint: {checkpoint}")
-            step = int(step_hint)
-        else:
-            step = int(metadata["step"])
-        output = self.report_root / f"readiness_{stage_name}_step{step}.json"
-        self.run(
-            f"readiness_{stage_name}_step{step}",
-            self.python_command(
-                "scripts/audit_long_training_readiness.py",
-                "--config", config,
-                "--store", self.args.feature_store,
-                "--feature-audit", self.report_root / "feature_store_audit.json",
-                "--equivalence-report", self.report_root / "feature_equivalence_100.json",
-                "--soak-report", self.report_root / "feature_store_soak_8rank.json",
-                "--ddp-runtime-audit", self.report_root / "ddp_runtime_8gpu.json",
-                "--skill-expert-config", self.skill_config,
-                "--checkpoint", checkpoint,
-                "--checkpoint-mode", "resume",
-                "--world-size", self.args.world_size,
-                "--min-equivalence-samples", self.args.equivalence_samples,
-                "--min-soak-steps", self.args.soak_steps,
-                *(
-                    ["--allow-missing-cgroup-metrics"]
-                    if self.args.disable_system_monitoring else []
-                ),
-                "--output", output,
-            ),
-        )
-        return output
-
     def run_training_segment(
         self,
         *,
@@ -711,11 +703,13 @@ class Launcher:
         log_freq: int,
         expected_stage: str,
         init_checkpoint: Path | None = None,
-        readiness: Path | None = None,
         route_mode: str | None = None,
     ) -> None:
         checkpoint = output_dir / "checkpoint_latest.pt"
         early_stop_report = output_dir / "early_stopping.json"
+        early_stop_contract = load_json(Path(config)).get("validation", {}).get(
+            "early_stopping", {}
+        )
         metadata = (
             checkpoint_metadata(checkpoint, expected_stage)
             if checkpoint.exists()
@@ -732,10 +726,15 @@ class Launcher:
                 and bool(report.get("stopped_early", False))
                 and int(report.get("step", -1)) == int(metadata["step"])
                 and int(report.get("max_steps", -1)) == max_steps
-                and report.get("metric") == "total_loss"
-                and float(report.get("min_delta", -1.0)) == self.args.early_stop_min_delta
-                and int(report.get("patience", -1)) == self.args.early_stop_patience
-                and int(report.get("min_steps", -1)) == self.args.early_stop_min_steps
+                and report.get("metric") == early_stop_contract.get("metric")
+                and float(report.get("min_delta", -1.0))
+                == float(early_stop_contract.get("min_delta", -2.0))
+                and int(report.get("patience", -1))
+                == int(early_stop_contract.get("patience", -2))
+                and int(report.get("min_steps", -1))
+                == int(early_stop_contract.get("min_steps", -2))
+                and report.get("validation_mode")
+                == early_stop_contract.get("validation_mode", "deployment")
             ):
                 print(
                     f"SKIP {task}: {expected_stage} already stopped early at step "
@@ -751,15 +750,26 @@ class Launcher:
             args += ["--resume", checkpoint]
         elif init_checkpoint is not None:
             args += ["--init-wam", init_checkpoint]
-        if readiness is not None:
-            args += ["--long-run-readiness-report", readiness]
         self.run(task, self.torchrun_command(script, *args))
         if self.args.dry_run:
-            self.virtual_checkpoints[str(checkpoint)] = {
+            virtual_metadata = {
                 "format": "flow_wam_skill_components_v2",
                 "stage": expected_stage,
                 "step": stop_step,
             }
+            if metadata is not None:
+                virtual_metadata["config"] = metadata.get("config", {})
+            elif init_checkpoint is not None:
+                predecessor_metadata = self.virtual_checkpoints.get(
+                    str(init_checkpoint)
+                )
+                if predecessor_metadata is not None:
+                    virtual_metadata["config"] = {
+                        "initialization_contract": checkpoint_predecessor_identity(
+                            predecessor_metadata
+                        )
+                    }
+            self.virtual_checkpoints[str(checkpoint)] = virtual_metadata
         if not self.args.dry_run:
             completed = checkpoint_metadata(checkpoint, expected_stage)
             completed_step = int(completed["step"]) if completed is not None else -1
@@ -772,10 +782,15 @@ class Launcher:
                     and bool(report.get("stopped_early", False))
                     and int(report.get("step", -1)) == completed_step
                     and int(report.get("max_steps", -1)) == max_steps
-                    and report.get("metric") == "total_loss"
-                    and float(report.get("min_delta", -1.0)) == self.args.early_stop_min_delta
-                    and int(report.get("patience", -1)) == self.args.early_stop_patience
-                    and int(report.get("min_steps", -1)) == self.args.early_stop_min_steps
+                    and report.get("metric") == early_stop_contract.get("metric")
+                    and float(report.get("min_delta", -1.0))
+                    == float(early_stop_contract.get("min_delta", -2.0))
+                    and int(report.get("patience", -1))
+                    == int(early_stop_contract.get("patience", -2))
+                    and int(report.get("min_steps", -1))
+                    == int(early_stop_contract.get("min_steps", -2))
+                    and report.get("validation_mode")
+                    == early_stop_contract.get("validation_mode", "deployment")
                 )
             if completed_step != stop_step and not stopped_early:
                 raise RuntimeError(f"{task} did not produce expected step {stop_step}: {checkpoint}")
@@ -789,17 +804,105 @@ class Launcher:
         if metadata is None or not report_path.is_file():
             return False
         report = load_json(report_path)
+        config_name = {
+            "nominal_flow_pretrain": "stage1",
+            "expert_warmstart": "stage2",
+            "joint": "stage3",
+        }[expected_stage]
+        early_stop_contract = load_json(
+            Path(self.runtime_configs[config_name])
+        ).get("validation", {}).get("early_stopping", {})
         return (
             report.get("format") == "mowe_validation_loss_early_stop_v1"
             and report.get("stage") == expected_stage
             and bool(report.get("stopped_early", False))
             and int(report.get("step", -1)) == int(metadata["step"])
             and int(report.get("max_steps", -1)) == max_steps
-            and report.get("metric") == "total_loss"
-            and float(report.get("min_delta", -1.0)) == self.args.early_stop_min_delta
-            and int(report.get("patience", -1)) == self.args.early_stop_patience
-            and int(report.get("min_steps", -1)) == self.args.early_stop_min_steps
+            and report.get("metric") == early_stop_contract.get("metric")
+            and float(report.get("min_delta", -1.0))
+            == float(early_stop_contract.get("min_delta", -2.0))
+            and int(report.get("patience", -1))
+            == int(early_stop_contract.get("patience", -2))
+            and int(report.get("min_steps", -1))
+            == int(early_stop_contract.get("min_steps", -2))
+            and report.get("validation_mode")
+            == early_stop_contract.get("validation_mode", "deployment")
         )
+
+    def validate_stage1_quality(self, stage_dir: Path) -> dict[str, Any]:
+        report_path = self.report_root / "stage1_quality_gate.json"
+        if self.args.dry_run:
+            report = {
+                "format": "mowe_stage1_quality_gate_v2",
+                "passed": None,
+                "status": "dry_run",
+            }
+            atomic_json(report_path, report)
+            self.record(
+                "stage1_quality_gate", status="dry_run", report=str(report_path)
+            )
+            return report
+        best_checkpoint = stage_dir / "checkpoint_best.pt"
+        selected_checkpoint = (
+            best_checkpoint
+            if best_checkpoint.is_file()
+            else stage_dir / "checkpoint_latest.pt"
+        )
+        selected_metadata = checkpoint_metadata(
+            selected_checkpoint, "nominal_flow_pretrain"
+        )
+        if selected_metadata is None:
+            raise RuntimeError(
+                f"Stage 1 checkpoint is missing before quality validation: {selected_checkpoint}"
+            )
+        report = stage1_quality_gate(
+            jsonl_rows(stage_dir / "validation_log.jsonl"),
+            required_average_improvement=self.args.stage1_quality_average_improvement,
+            required_min_horizon_improvement=self.args.stage1_quality_min_horizon_improvement,
+            min_unique_episodes=self.args.min_validation_episodes,
+            min_action_distance_gate=self.args.stage1_quality_min_action_gate,
+            validation_step=int(selected_metadata["step"]),
+        )
+        report["checkpoint"] = str(selected_checkpoint)
+        atomic_json(report_path, report)
+        self.record(
+            "stage1_quality_gate",
+            status="complete" if report["passed"] else "failed",
+            report=str(report_path),
+            validation_step=report.get("validation_step"),
+        )
+        if not report["passed"]:
+            raise RuntimeError(
+                "Stage 1 deployment quality gate failed; Stage 2 is blocked. "
+                f"See {report_path}: {report.get('errors', [])}"
+            )
+        return report
+
+    def validate_stage_predecessor(
+        self,
+        metadata: dict[str, Any] | None,
+        predecessor: Path,
+        *,
+        stage_name: str,
+    ) -> None:
+        if metadata is None:
+            return
+        predecessor_metadata = (
+            checkpoint_metadata(predecessor)
+            or self.virtual_checkpoints.get(str(predecessor))
+        )
+        if predecessor_metadata is None:
+            raise RuntimeError(
+                f"Cannot validate {stage_name} predecessor: {predecessor}"
+            )
+        expected = checkpoint_predecessor_identity(predecessor_metadata)
+        observed = metadata.get("config", {}).get("initialization_contract")
+        if observed != expected:
+            raise RuntimeError(
+                f"Existing {stage_name} checkpoint was initialized from a different "
+                "predecessor. Preserve it and use a new --run-id/stage directory; "
+                "do not resume it after the predecessor changed."
+            )
 
     def validate_smoke(self, stage_dir: Path, stage: str) -> dict[str, Any]:
         train = jsonl_rows(stage_dir / "train_log.jsonl")
@@ -840,15 +943,26 @@ class Launcher:
                 step = target
         if not self.args.dry_run:
             self.validate_smoke(output, "stage1")
+        if step < min(1000, self.args.stage1_max_steps):
+            target = min(1000, self.args.stage1_max_steps)
+            self.run_training_segment(
+                task=f"ddp_stage1_{step}_{target}",
+                script="scripts/pretrain_nominal_flow_wam.py",
+                config=self.runtime_configs["stage1"],
+                output_dir=output,
+                max_steps=self.args.stage1_max_steps,
+                stop_step=target,
+                save_freq=100,
+                log_freq=self.args.long_log_freq,
+                expected_stage="nominal_flow_pretrain",
+            )
+            step = target
         if step < self.args.stage1_max_steps and not (
             not self.args.dry_run
             and self.stage_stopped_early(
                 output, "nominal_flow_pretrain", self.args.stage1_max_steps
             )
         ):
-            readiness = self.issue_readiness(
-                "stage1", self.runtime_configs["stage1"], checkpoint, step_hint=step
-            )
             self.run_training_segment(
                 task=f"ddp_stage1_{step}_{self.args.stage1_max_steps}",
                 script="scripts/pretrain_nominal_flow_wam.py",
@@ -859,9 +973,9 @@ class Launcher:
                 save_freq=self.args.long_save_freq,
                 log_freq=self.args.long_log_freq,
                 expected_stage="nominal_flow_pretrain",
-                readiness=readiness,
             )
-        return checkpoint
+        best = output / "checkpoint_best.pt"
+        return best if not self.args.dry_run and best.is_file() else checkpoint
 
     def train_stage2(self, predecessor: Path) -> Path:
         output = self.stage_root / "stage2"
@@ -870,6 +984,9 @@ class Launcher:
             checkpoint_metadata(checkpoint, "expert_warmstart")
             if checkpoint.exists()
             else self.virtual_checkpoints.get(str(checkpoint))
+        )
+        self.validate_stage_predecessor(
+            metadata, predecessor, stage_name="Stage 2"
         )
         step = int(metadata["step"]) if metadata else 0
         if step < 100:
@@ -895,9 +1012,6 @@ class Launcher:
                 output, "expert_warmstart", self.args.stage2_max_steps
             )
         ):
-            readiness = self.issue_readiness(
-                "stage2", self.runtime_configs["stage2"], checkpoint, step_hint=step
-            )
             self.run_training_segment(
                 task=f"ddp_stage2_{step}_{self.args.stage2_max_steps}",
                 script="scripts/warmstart_skill_flow_experts.py",
@@ -908,10 +1022,10 @@ class Launcher:
                 save_freq=self.args.long_save_freq,
                 log_freq=self.args.long_log_freq,
                 expected_stage="expert_warmstart",
-                readiness=readiness,
                 route_mode="oracle",
             )
-        return checkpoint
+        best = output / "checkpoint_best.pt"
+        return best if not self.args.dry_run and best.is_file() else checkpoint
 
     def train_stage3(self, predecessor: Path) -> Path:
         output = self.stage_root / "stage3"
@@ -920,6 +1034,9 @@ class Launcher:
             checkpoint_metadata(checkpoint, "joint")
             if checkpoint.exists()
             else self.virtual_checkpoints.get(str(checkpoint))
+        )
+        self.validate_stage_predecessor(
+            metadata, predecessor, stage_name="Stage 3"
         )
         step = int(metadata["step"]) if metadata else 0
         if step < 100:
@@ -942,9 +1059,6 @@ class Launcher:
             not self.args.dry_run
             and self.stage_stopped_early(output, "joint", self.args.stage3_max_steps)
         ):
-            readiness = self.issue_readiness(
-                "stage3", self.runtime_configs["stage3"], checkpoint, step_hint=step
-            )
             self.run_training_segment(
                 task=f"ddp_stage3_{step}_{self.args.stage3_max_steps}",
                 script="scripts/train_flow_wam_skill_moe.py",
@@ -955,15 +1069,15 @@ class Launcher:
                 save_freq=self.args.long_save_freq,
                 log_freq=self.args.long_log_freq,
                 expected_stage="joint",
-                readiness=readiness,
             )
-        return checkpoint
+        best = output / "checkpoint_best.pt"
+        return best if not self.args.dry_run and best.is_file() else checkpoint
 
     def execute(self) -> None:
         self.preflight()
         self.skill_config = self.ensure_static_evidence()
-        self.ensure_node_evidence()
         stage1 = self.train_stage1()
+        self.validate_stage1_quality(self.stage_root / "stage1")
         stage2 = self.train_stage2(stage1)
         stage3 = self.train_stage3(stage2)
         self.record(
@@ -978,7 +1092,7 @@ class Launcher:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="一键完成 MoWE 正式 8 卡审计、readiness 与 Stage 1/2/3 训练。",
+        description="一键完成 MoWE 数据审计与正式 8 卡 Stage 1/2/3 训练。",
     )
 
     # 代码仓库根目录：换服务器后通常需要修改。
@@ -1003,7 +1117,7 @@ def parse_args() -> argparse.Namespace:
     # 本次正式 lineage 的唯一 ID；兼容旧平台参数名 --run_id。
     parser.add_argument("--run-id", "--run_id", required=True, help="实验/lineage 名称，建议包含日期与模型版本。")
     # 报告目录；默认 <run-root-dir>/<run-id>/reports。
-    parser.add_argument("--report-root", type=Path, help="审计、readiness 和启动日志目录。")
+    parser.add_argument("--report-root", type=Path, help="数据审计和启动日志目录。")
     # Stage checkpoint 目录；默认 <run-root-dir>/<run-id>/ddp8。
     parser.add_argument("--stage-root", type=Path, help="Stage 1/2/3 checkpoint 根目录。")
     # 可选 Python 解释器；默认使用启动 start_mtp.py 的解释器。
@@ -1036,6 +1150,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="刷新最佳 validation total_loss 所需的最小下降量。")
     parser.add_argument("--early-stop-patience", type=int, default=5, help="连续多少次验证改善不足后早停。")
     parser.add_argument("--early-stop-min-steps", type=int, default=5000, help="允许早停前每个阶段至少训练的步数。")
+    parser.add_argument(
+        "--min-validation-episodes",
+        type=int,
+        default=32,
+        help="每次正式验证至少覆盖的不同 episode 数。",
+    )
+    parser.add_argument(
+        "--stage1-quality-average-improvement",
+        type=float,
+        default=0.10,
+        help="Stage 1 future smooth-L1 相对 copy-current 的三 horizon 最低平均改善。",
+    )
+    parser.add_argument(
+        "--stage1-quality-min-horizon-improvement",
+        type=float,
+        default=0.0,
+        help="Stage 1 任一 H=4/8/16 horizon 相对 copy-current 的最低改善。",
+    )
+    parser.add_argument(
+        "--stage1-quality-min-action-gate",
+        type=float,
+        default=0.10,
+        help="Stage 1 deployment validation 的最低平均 nominal-action distance gate。",
+    )
 
     # 100-window raw/cache 等价性参数；不建议放宽默认容差。
     parser.add_argument("--equivalence-samples", type=int, default=100, help="等价性窗口数，正式至少 100。")
@@ -1048,30 +1186,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-suite-imbalance-ratio", type=float, default=1.50, help="suite imbalance 上限。")
     parser.add_argument("--max-skill-imbalance-ratio", type=float, default=2.00, help="skill imbalance 上限。")
 
-    # 8-rank continuous soak 参数。
-    parser.add_argument("--soak-steps", type=int, default=10000, help="每 rank soak 读取步数。")
-    parser.add_argument("--soak-warmup-steps", type=int, default=1000, help="soak warmup 步数。")
-    parser.add_argument("--soak-sample-every", type=int, default=250, help="cgroup 采样间隔。")
-    parser.add_argument("--max-anon-growth-mib", type=float, default=512.0, help="匿名内存增长上限 MiB。")
-    parser.add_argument("--max-working-set-growth-mib", type=float, default=2048.0, help="working-set 增长上限 MiB。")
-    parser.add_argument("--max-anon-slope-mib", type=float, default=64.0, help="每千步 anon 斜率上限。")
-    parser.add_argument("--max-working-set-slope-mib", type=float, default=256.0, help="每千步 working-set 斜率上限。")
-    # 正式启动资源占用硬门槛。
-    parser.add_argument("--memory-guard-fraction", type=float, default=0.80, help="cgroup working-set 比例上限。")
-    parser.add_argument("--gpu-memory-guard-fraction", type=float, default=0.85, help="GPU peak 比例上限。")
-    # 无系统权限平台的显式降级模式：不读取 /proc、cgroup 或宿主机内存/OOM 指标。
-    parser.add_argument(
-        "--disable-system-monitoring",
-        "--disable-cgroup-monitoring",
-        action="store_true",
-        dest="disable_system_monitoring",
-        help="关闭所有 /proc/cgroup/宿主机资源检查；保留 CUDA/NCCL/GPU 显存检查。",
-    )
-
     # 强制重做与数据/store 相关的静态审计。
     parser.add_argument("--force-static-audits", action="store_true", help="强制重跑 RLDS/feature/equivalence 审计。")
-    # 强制重做与当前 node/boot/cgroup 绑定的 soak/runtime 审计。
-    parser.add_argument("--force-node-audits", action="store_true", help="强制重跑 soak 与 8-GPU runtime audit。")
     # 只打印完整命令和写 dry-run 状态，不启动审计或训练；可在单卡机器检查参数。
     parser.add_argument("--dry-run", action="store_true", help="仅验证路径并打印计划，不要求 8 张 GPU。")
 

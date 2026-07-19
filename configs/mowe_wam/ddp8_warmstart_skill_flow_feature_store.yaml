@@ -29,6 +29,16 @@
     "max_unattested_steps": 100,
     "report_path": null
   },
+  "validation": {
+    "enabled": true,
+    "eval_freq": 500,
+    "num_batches": null,
+    "windows_per_episode": 1,
+    "min_unique_episodes": 32,
+    "modes": ["diagnostic", "deployment"],
+    "seed": 1701,
+    "run_at_start": true
+  },
   "training": {
     "precision": "bf16",
     "batch_size": 1,

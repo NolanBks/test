@@ -24,6 +24,7 @@ from mowe_wam.backbones import (
 from mowe_wam.data import (
     CACHE_FORMAT,
     EpisodeAwareDistributedSampler,
+    EpisodeBalancedValidationSampler,
     LatentWAMCollator,
     LiberoSequenceDataset,
     LABEL_VERSION,
@@ -682,10 +683,16 @@ def build_flow_validation_dataloader(
         return None
     if data_cfg.get("backend", "rlds") == "mowe_feature_store_v1":
         dataset = _build_feature_store_dataset(cfg, partition="validation")
+        sampler = EpisodeBalancedValidationSampler(
+            dataset,
+            windows_per_episode=int(validation_cfg.get("windows_per_episode", 1)),
+            seed=int(validation_cfg.get("seed", 1701)),
+        )
         return torch.utils.data.DataLoader(
             dataset,
             batch_size=int(cfg["training"].get("batch_size", 1)),
             collate_fn=LatentWAMCollator(),
+            sampler=sampler,
             num_workers=0,
             pin_memory=bool(data_cfg.get("pin_memory", False))
             and resolve_device(cfg).startswith("cuda"),
@@ -1043,6 +1050,27 @@ def readiness_checkpoint_identity(
                 data_contract.get("feature_store_contract")
             ),
         },
+    }
+
+
+def checkpoint_semantic_identity(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Return the path-independent identity of a stage predecessor checkpoint."""
+
+    config = metadata.get("config")
+    data_contract = metadata.get("data_contract") or {}
+    return {
+        "format": "flow_wam_predecessor_identity_v1",
+        "stage": metadata.get("stage"),
+        "step": int(metadata.get("step", -1)),
+        "training_contract_sha256": (
+            _sha256_json(_resume_training_contract(config))
+            if isinstance(config, dict)
+            else None
+        ),
+        "feature_store_contract_sha256": _sha256_json(
+            data_contract.get("feature_store_contract")
+        ),
+        "backbone_identifier": metadata.get("backbone_identifier"),
     }
 
 
@@ -1924,6 +1952,8 @@ def validation_loss_early_stopping_state(
     min_delta: float = 1e-4,
     patience: int = 5,
     min_steps: int = 5000,
+    validation_mode: str | None = None,
+    min_unique_episodes: int = 1,
 ) -> dict[str, Any]:
     """Rebuild deterministic loss-only early-stopping state from validation logs."""
 
@@ -1933,6 +1963,8 @@ def validation_loss_early_stopping_state(
         raise ValueError("validation.early_stopping.patience must be positive.")
     if min_steps < 0:
         raise ValueError("validation.early_stopping.min_steps must be non-negative.")
+    if min_unique_episodes < 1:
+        raise ValueError("min_unique_episodes must be positive.")
     if not metric:
         raise ValueError("validation.early_stopping.metric must be non-empty.")
 
@@ -1942,6 +1974,14 @@ def validation_loss_early_stopping_state(
     for record in records:
         if record.get("stage") != stage:
             continue
+        if validation_mode is not None and record.get("validation_mode") != validation_mode:
+            continue
+        if int(record.get("unique_episodes", min_unique_episodes)) < min_unique_episodes:
+            raise RuntimeError(
+                "Validation evidence is not episode-diverse enough for early stopping: "
+                f"step={record.get('step')} unique_episodes={record.get('unique_episodes')} "
+                f"required={min_unique_episodes}."
+            )
         try:
             step = int(record["step"])
             value = float(record.get("metrics", {})[metric])
@@ -1953,13 +1993,19 @@ def validation_loss_early_stopping_state(
             )
         losses_by_step[step] = value
 
+    all_validation_count = len(losses_by_step)
+    losses_by_step = {
+        step: value for step, value in losses_by_step.items() if step >= min_steps
+    }
     best_value: float | None = None
+    best_step: int | None = None
     current_value: float | None = None
     current_step = 0
     bad_validation_count = 0
     for current_step, current_value in sorted(losses_by_step.items()):
         if best_value is None or best_value - current_value >= min_delta:
             best_value = current_value
+            best_step = current_step
             bad_validation_count = 0
         else:
             bad_validation_count += 1
@@ -1972,15 +2018,43 @@ def validation_loss_early_stopping_state(
     return {
         "metric": metric,
         "best_value": best_value,
+        "best_step": best_step,
         "current_value": current_value,
         "current_step": current_step,
         "bad_validation_count": bad_validation_count,
         "validation_count": len(losses_by_step),
+        "pre_schedule_validation_count": all_validation_count - len(losses_by_step),
         "min_delta": float(min_delta),
         "patience": int(patience),
         "min_steps": int(min_steps),
+        "validation_mode": validation_mode,
+        "min_unique_episodes": int(min_unique_episodes),
+        "current_is_best": best_step is not None and best_step == current_step,
         "should_stop": should_stop,
     }
+
+
+def schedule_aware_early_stopping_min_steps(
+    cfg: dict[str, Any], stage: str, configured_min_steps: int
+) -> int:
+    """Delay early stopping until every deployment schedule has completed."""
+
+    minimum = int(configured_min_steps)
+    if minimum < 0:
+        raise ValueError("configured_min_steps must be non-negative.")
+    early = cfg.get("validation", {}).get("early_stopping", {})
+    if not bool(early.get("require_schedule_completion", True)):
+        return minimum
+    max_steps = int(cfg.get("training", {}).get("max_steps", 1))
+    completion_ratios = [
+        float(cfg.get("action_condition", {}).get("nominal_end_ratio", 0.70))
+    ]
+    if stage == "joint":
+        completion_ratios.append(
+            float(cfg.get("router", {}).get("predicted_route_end_ratio", 0.70))
+        )
+    schedule_step = math.ceil(max(completion_ratios, default=0.0) * max_steps)
+    return max(minimum, schedule_step)
 
 
 def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
@@ -2232,22 +2306,57 @@ def distributed_episode_overlap(records: list[dict[str, Any]]) -> list[str]:
     return sorted(overlap)
 
 
-def evaluate_flow_model(cfg, model, dataloader, *, stage: str, step: int):
-    """Evaluate a fixed number of validation batches without perturbing training RNG."""
+def evaluate_flow_model(
+    cfg,
+    model,
+    dataloader,
+    *,
+    stage: str,
+    step: int,
+    validation_mode: str = "diagnostic",
+):
+    """Evaluate deterministic diagnostic or deployment-like validation.
+
+    ``diagnostic`` retains teacher actions and, after Stage 1, oracle routes so
+    component quality remains easy to interpret. ``deployment`` conditions the
+    WAM on nominal actions and always uses hard predicted routes. Early stopping
+    must use the latter; otherwise it can stop before the train-time deployment
+    schedules have even started.
+    """
 
     torch = require_torch()
     if dataloader is None:
         return None
     validation_cfg = cfg.get("validation", {})
-    num_batches = int(validation_cfg.get("num_batches", 32))
-    if num_batches < 1:
-        raise ValueError("validation.num_batches must be positive.")
+    configured_batches = validation_cfg.get("num_batches", 32)
+    num_batches = None if configured_batches in {None, "all"} else int(configured_batches)
+    if num_batches is not None and num_batches < 1:
+        raise ValueError("validation.num_batches must be positive or null/all.")
+    if validation_mode not in {"diagnostic", "deployment"}:
+        raise ValueError("validation_mode must be diagnostic or deployment.")
+    action_condition_mode = (
+        "nominal" if validation_mode == "deployment" else "ground_truth"
+    )
+    route_mode = (
+        "predicted"
+        if validation_mode == "deployment" or stage == "nominal_flow_pretrain"
+        else "oracle"
+    )
     seed = int(validation_cfg.get("seed", 1701))
     device = resolve_device(cfg)
     precision = str(cfg["training"].get("precision", "bf16"))
     devices = [torch.cuda.current_device()] if device.startswith("cuda") else []
     sums: dict[str, float] = {}
     horizon_sums: dict[str, dict[str, float]] = {}
+    route_correct_by_position: list[float] = []
+    route_valid_by_position: list[int] = []
+    boundary_counts = {"true_positive": 0, "predicted": 0, "target": 0}
+    edit_distance_sum = 0.0
+    edit_distance_count = 0
+    view_weight_sum = None
+    view_sample_count = 0
+    action_distance_gate_sum = 0.0
+    action_distance_gate_count = 0
     episodes = set()
     batches = 0
     model.eval()
@@ -2257,14 +2366,16 @@ def evaluate_flow_model(cfg, model, dataloader, *, stage: str, step: int):
             if device.startswith("cuda"):
                 torch.cuda.manual_seed_all(seed)
             for batch_index, batch in enumerate(dataloader):
-                if batch_index >= num_batches:
+                if num_batches is not None and batch_index >= num_batches:
                     break
                 with autocast_context(device, precision):
                     outputs = model(
                         batch,
-                        action_condition_mode="ground_truth",
-                        teacher_forcing_probability=1.0,
-                        route_mode="predicted" if stage == "nominal_flow_pretrain" else "oracle",
+                        action_condition_mode=action_condition_mode,
+                        teacher_forcing_probability=(
+                            0.0 if action_condition_mode == "nominal" else 1.0
+                        ),
+                        route_mode=route_mode,
                         gumbel_temperature=1.0,
                         flow_seed=seed + batch_index,
                         compute_teacher_targets=True,
@@ -2278,6 +2389,7 @@ def evaluate_flow_model(cfg, model, dataloader, *, stage: str, step: int):
                         stage=stage,
                     )
                 mechanism = _mechanism_metrics(outputs, batch)
+                route = _route_metrics(outputs, batch)
                 for name, value in losses.items():
                     if hasattr(value, "numel") and value.numel() == 1:
                         sums[name] = sums.get(name, 0.0) + float(value.detach())
@@ -2285,6 +2397,35 @@ def evaluate_flow_model(cfg, model, dataloader, *, stage: str, step: int):
                     target = horizon_sums.setdefault(horizon, {})
                     for name, value in values.items():
                         target[name] = target.get(name, 0.0) + float(value)
+                valid_by_position = route.get("route_valid_by_position", [])
+                accuracy_by_position = route.get("route_accuracy_by_position", [])
+                if len(route_valid_by_position) < len(valid_by_position):
+                    missing = len(valid_by_position) - len(route_valid_by_position)
+                    route_valid_by_position.extend([0] * missing)
+                    route_correct_by_position.extend([0.0] * missing)
+                for position, valid in enumerate(valid_by_position):
+                    route_valid_by_position[position] += int(valid)
+                    route_correct_by_position[position] += float(
+                        accuracy_by_position[position]
+                    ) * int(valid)
+                boundary_counts["true_positive"] += int(
+                    route.get("boundary_true_positive_count", 0)
+                )
+                boundary_counts["predicted"] += int(
+                    route.get("boundary_predicted_positive_count", 0)
+                )
+                boundary_counts["target"] += int(
+                    route.get("boundary_target_positive_count", 0)
+                )
+                edit_distance_sum += float(route.get("schedule_edit_distance_sum", 0.0))
+                edit_distance_count += int(route.get("schedule_edit_distance_count", 0))
+                weights = outputs["current_view_weights"].float().detach()
+                weight_sum = weights.sum(dim=0).cpu()
+                view_weight_sum = weight_sum if view_weight_sum is None else view_weight_sum + weight_sum
+                view_sample_count += int(weights.shape[0])
+                gates = outputs["nominal_action_distance_gate"].float().detach()
+                action_distance_gate_sum += float(gates.sum())
+                action_distance_gate_count += int(gates.numel())
                 episodes.update(str(value) for value in batch.get("episode_id", []))
                 batches += 1
     finally:
@@ -2292,17 +2433,54 @@ def evaluate_flow_model(cfg, model, dataloader, *, stage: str, step: int):
         configure_flow_stage(model, stage)
     if batches == 0:
         raise RuntimeError("Validation partition yielded no valid windows.")
+    route_accuracy = [
+        correct / max(valid, 1)
+        for correct, valid in zip(route_correct_by_position, route_valid_by_position)
+    ]
+    precision = boundary_counts["true_positive"] / max(boundary_counts["predicted"], 1)
+    recall = boundary_counts["true_positive"] / max(boundary_counts["target"], 1)
+    sampler = getattr(dataloader, "sampler", None)
     return {
         "kind": "flow_wam_validation",
         "step": int(step),
         "stage": stage,
+        "validation_mode": validation_mode,
+        "action_condition_mode": action_condition_mode,
+        "route_mode": route_mode,
         "batches": batches,
         "unique_episodes": len(episodes),
+        "validation_episode_pool": getattr(sampler, "episode_count", None),
+        "sampling_contract": (
+            "episode_balanced_deterministic_v1"
+            if isinstance(sampler, EpisodeBalancedValidationSampler)
+            else "dataloader_order_v1"
+        ),
         "episode_partition": "validation",
         "validation_fraction": float(cfg["data"].get("validation_fraction", 0.0)),
         "split_seed": int(cfg["data"].get("split_seed", 17)),
         "seed": seed,
         "metrics": {name: value / batches for name, value in sorted(sums.items())},
+        "deployment_metrics": {
+            "route_accuracy_by_position": route_accuracy,
+            "current_skill_accuracy": route_accuracy[0] if route_accuracy else 0.0,
+            "future_position_accuracy": (
+                sum(route_accuracy[1:]) / max(len(route_accuracy) - 1, 1)
+                if route_accuracy
+                else 0.0
+            ),
+            "boundary_precision": precision,
+            "boundary_recall": recall,
+            "boundary_f1": 2.0 * precision * recall / max(precision + recall, 1e-8),
+            "schedule_edit_distance": edit_distance_sum / max(edit_distance_count, 1),
+            "mean_nominal_action_distance_gate": (
+                action_distance_gate_sum / max(action_distance_gate_count, 1)
+            ),
+            "current_view_weights_mean": (
+                (view_weight_sum / max(view_sample_count, 1)).tolist()
+                if view_weight_sum is not None
+                else []
+            ),
+        },
         "future_horizon_metrics": {
             horizon: {name: value / batches for name, value in sorted(values.items())}
             for horizon, values in sorted(horizon_sums.items(), key=lambda item: int(item[0]))
@@ -2335,27 +2513,37 @@ def _run_flow_training_impl(
     cfg["training"]["device"] = distributed.device
     cfg["distributed_contract"] = distributed_contract(cfg, distributed)
     resource_guard_cfg = cfg["training"].get("distributed", {})
-    memory_guard_fraction = float(resource_guard_cfg.get("memory_guard_fraction", 0.80))
-    gpu_memory_guard_fraction = float(
-        resource_guard_cfg.get("gpu_memory_guard_fraction", 0.85)
+    resource_monitoring_enabled = bool(
+        resource_guard_cfg.get("resource_monitoring", True)
     )
-    if not 0 < memory_guard_fraction <= 1 or not 0 < gpu_memory_guard_fraction <= 1:
-        raise ValueError("Distributed resource guard fractions must be in (0,1].")
-    resource_baseline = process_resource_metrics(distributed)
-    require_cgroup_metrics = bool(
-        resource_guard_cfg.get("require_cgroup_metrics", False)
-    ) and distributed.enabled
-    enforce_resource_metric_contract(
-        distributed,
-        resource_baseline,
-        require_cgroup=require_cgroup_metrics,
-        require_gpu=distributed.enabled and distributed.device.startswith("cuda"),
-    )
-    enforce_cgroup_memory_guard(
-        distributed,
-        resource_baseline,
-        memory_guard_fraction,
-    )
+    resource_baseline: dict[str, Any] = {}
+    require_cgroup_metrics = False
+    memory_guard_fraction = 0.0
+    gpu_memory_guard_fraction = 0.0
+    if resource_monitoring_enabled:
+        memory_guard_fraction = float(
+            resource_guard_cfg.get("memory_guard_fraction", 0.80)
+        )
+        gpu_memory_guard_fraction = float(
+            resource_guard_cfg.get("gpu_memory_guard_fraction", 0.85)
+        )
+        if not 0 < memory_guard_fraction <= 1 or not 0 < gpu_memory_guard_fraction <= 1:
+            raise ValueError("Distributed resource guard fractions must be in (0,1].")
+        resource_baseline = process_resource_metrics(distributed)
+        require_cgroup_metrics = bool(
+            resource_guard_cfg.get("require_cgroup_metrics", False)
+        ) and distributed.enabled
+        enforce_resource_metric_contract(
+            distributed,
+            resource_baseline,
+            require_cgroup=require_cgroup_metrics,
+            require_gpu=distributed.enabled and distributed.device.startswith("cuda"),
+        )
+        enforce_cgroup_memory_guard(
+            distributed,
+            resource_baseline,
+            memory_guard_fraction,
+        )
     feature_backend = cfg.get("data", {}).get("backend", "rlds") == "mowe_feature_store_v1"
     if feature_backend:
         resolve_feature_store_contract(cfg)
@@ -2402,26 +2590,34 @@ def _run_flow_training_impl(
                 world_size=distributed.world_size,
             )
         )
-    setup_resources = process_resource_metrics(distributed)
-    enforce_cgroup_memory_guard(
-        distributed,
-        setup_resources,
-        memory_guard_fraction,
-    )
-    enforce_gpu_memory_guard(
-        distributed,
-        setup_resources,
-        gpu_memory_guard_fraction,
-    )
-    enforce_no_new_oom_events(distributed, setup_resources, resource_baseline)
-    cfg["launch_resource_metrics_by_rank"] = distributed.all_gather_objects(setup_resources)
-    runtime_identity = consolidate_runtime_identities(
-        distributed.all_gather_objects(
-            local_runtime_identity(distributed, setup_resources)
-        ),
-        require_cuda=distributed.device.startswith("cuda"),
-        require_node_identity=require_cgroup_metrics,
-    )
+    if resource_monitoring_enabled:
+        setup_resources = process_resource_metrics(distributed)
+        enforce_cgroup_memory_guard(
+            distributed,
+            setup_resources,
+            memory_guard_fraction,
+        )
+        enforce_gpu_memory_guard(
+            distributed,
+            setup_resources,
+            gpu_memory_guard_fraction,
+        )
+        enforce_no_new_oom_events(distributed, setup_resources, resource_baseline)
+        cfg["launch_resource_metrics_by_rank"] = distributed.all_gather_objects(
+            setup_resources
+        )
+        runtime_identity = consolidate_runtime_identities(
+            distributed.all_gather_objects(
+                local_runtime_identity(distributed, setup_resources)
+            ),
+            require_cuda=distributed.device.startswith("cuda"),
+            require_node_identity=require_cgroup_metrics,
+        )
+    else:
+        runtime_identity = {
+            "resource_monitoring": False,
+            "rank_count": int(distributed.world_size),
+        }
     cfg["runtime_identity"] = runtime_identity
     skill_cfg = load_config(cfg["skill_expert_config"])
     validate_skill_config(skill_cfg)
@@ -2467,6 +2663,9 @@ def _run_flow_training_impl(
             allow_world_size_change=allow_world_size_change,
         )
         validate_checkpoint_contract(checkpoint_metadata, cfg)
+        cfg["initialization_contract"] = checkpoint_semantic_identity(
+            checkpoint_metadata
+        )
         start_step = 0
     if resume:
         if init_checkpoint:
@@ -2487,6 +2686,11 @@ def _run_flow_training_impl(
             allow_world_size_change=allow_world_size_change,
         )
         validate_checkpoint_contract(checkpoint_metadata, cfg)
+        saved_initialization = checkpoint_metadata.get("config", {}).get(
+            "initialization_contract"
+        )
+        if saved_initialization is not None:
+            cfg["initialization_contract"] = saved_initialization
         validate_resume_schedule_contract(checkpoint_metadata, cfg)
         sampler_states = checkpoint_metadata.get("sampler_state_by_rank") or []
         if isinstance(sampler, EpisodeAwareDistributedSampler) and len(sampler_states) == distributed.world_size:
@@ -2500,7 +2704,7 @@ def _run_flow_training_impl(
         raise ValueError(
             f"training.stop_step must be between resumed step {start_step} and max_steps {max_steps}."
         )
-    if feature_backend:
+    if feature_backend and resource_monitoring_enabled:
         enforce_long_run_readiness(
             cfg,
             stage=stage,
@@ -2511,6 +2715,13 @@ def _run_flow_training_impl(
             checkpoint_mode=checkpoint_mode,
             runtime_identity=runtime_identity,
         )
+    elif feature_backend:
+        cfg.setdefault("long_run_readiness", {})["attestation"] = {
+            "required": False,
+            "validated": False,
+            "mode": "disabled_no_resource_monitoring",
+            "planned_optimizer_steps": int(stop_step) - int(start_step),
+        }
 
     train_model = raw_model
     if distributed.enabled:
@@ -2541,21 +2752,22 @@ def _run_flow_training_impl(
         else:
             ddp_kwargs["broadcast_buffers"] = sync_buffers
         train_model = torch.nn.parallel.DistributedDataParallel(raw_model, **ddp_kwargs)
-    post_ddp_resources = process_resource_metrics(distributed)
-    enforce_cgroup_memory_guard(
-        distributed,
-        post_ddp_resources,
-        memory_guard_fraction,
-    )
-    enforce_gpu_memory_guard(
-        distributed,
-        post_ddp_resources,
-        gpu_memory_guard_fraction,
-    )
-    enforce_no_new_oom_events(distributed, post_ddp_resources, resource_baseline)
-    cfg["post_ddp_resource_metrics_by_rank"] = distributed.all_gather_objects(
-        post_ddp_resources
-    )
+    if resource_monitoring_enabled:
+        post_ddp_resources = process_resource_metrics(distributed)
+        enforce_cgroup_memory_guard(
+            distributed,
+            post_ddp_resources,
+            memory_guard_fraction,
+        )
+        enforce_gpu_memory_guard(
+            distributed,
+            post_ddp_resources,
+            gpu_memory_guard_fraction,
+        )
+        enforce_no_new_oom_events(distributed, post_ddp_resources, resource_baseline)
+        cfg["post_ddp_resource_metrics_by_rank"] = distributed.all_gather_objects(
+            post_ddp_resources
+        )
 
     class_weights = torch.as_tensor(
         skill_cfg.get("class_weights_inverse_sqrt", [1.0] * 7),
@@ -2579,7 +2791,15 @@ def _run_flow_training_impl(
     early_stopping_metric = str(early_stopping_cfg.get("metric", "total_loss"))
     early_stopping_min_delta = float(early_stopping_cfg.get("min_delta", 1e-4))
     early_stopping_patience = int(early_stopping_cfg.get("patience", 5))
-    early_stopping_min_steps = int(early_stopping_cfg.get("min_steps", 5000))
+    early_stopping_min_steps = schedule_aware_early_stopping_min_steps(
+        cfg,
+        stage,
+        int(early_stopping_cfg.get("min_steps", 5000)),
+    )
+    early_stopping_mode = str(
+        early_stopping_cfg.get("validation_mode", "deployment")
+    )
+    min_validation_episodes = int(validation_cfg.get("min_unique_episodes", 1))
     early_stopping_report_path = output_dir / "early_stopping.json"
     if bool(validation_cfg.get("enabled", False)) and validation_freq < 1:
         raise ValueError("validation.eval_freq must be positive.")
@@ -2593,6 +2813,8 @@ def _run_flow_training_impl(
             min_delta=early_stopping_min_delta,
             patience=early_stopping_patience,
             min_steps=early_stopping_min_steps,
+            validation_mode=early_stopping_mode,
+            min_unique_episodes=min_validation_episodes,
         )
     if accumulation < 1 or log_freq < 1 or save_freq < 1:
         raise ValueError(
@@ -2601,29 +2823,41 @@ def _run_flow_training_impl(
     if distributed.is_main:
         _write_json_atomic(output_dir / "config_resolved.json", cfg)
     distributed.barrier()
-    if bool(validation_cfg.get("enabled", False)) and bool(validation_cfg.get("run_at_start", True)):
-        distributed.barrier()
-        if distributed.is_main:
-            validation_record = evaluate_flow_model(
+
+    def run_validation(current_step: int) -> list[dict[str, Any]]:
+        records = []
+        for validation_mode in validation_cfg.get(
+            "modes", ["diagnostic", "deployment"]
+        ):
+            record = evaluate_flow_model(
                 cfg,
                 raw_model,
                 validation_dataloader,
                 stage=stage,
-                step=step,
+                step=current_step,
+                validation_mode=str(validation_mode),
             )
-            _write_jsonl(validation_log_path, validation_record)
-            print(json.dumps(_jsonable(validation_record), sort_keys=True), flush=True)
+            _write_jsonl(validation_log_path, record)
+            print(json.dumps(_jsonable(record), sort_keys=True), flush=True)
+            records.append(record)
+        return records
+
+    if bool(validation_cfg.get("enabled", False)) and bool(validation_cfg.get("run_at_start", True)):
         distributed.barrier()
-        validation_resources = process_resource_metrics(distributed)
-        enforce_cgroup_memory_guard(
-            distributed, validation_resources, memory_guard_fraction
-        )
-        enforce_gpu_memory_guard(
-            distributed, validation_resources, gpu_memory_guard_fraction
-        )
-        enforce_no_new_oom_events(
-            distributed, validation_resources, resource_baseline
-        )
+        if distributed.is_main:
+            run_validation(step)
+        distributed.barrier()
+        if resource_monitoring_enabled:
+            validation_resources = process_resource_metrics(distributed)
+            enforce_cgroup_memory_guard(
+                distributed, validation_resources, memory_guard_fraction
+            )
+            enforce_gpu_memory_guard(
+                distributed, validation_resources, gpu_memory_guard_fraction
+            )
+            enforce_no_new_oom_events(
+                distributed, validation_resources, resource_baseline
+            )
     while step < stop_step:
         try:
             batch = next(iterator)
@@ -2821,7 +3055,11 @@ def _run_flow_training_impl(
                     for horizon, error in zip(cfg["data"]["future_horizons"], future_errors)
                 },
                 "cache_fingerprint": cfg.get("teacher", {}).get("cache_path"),
-                "resource_metrics": process_resource_metrics(distributed),
+                **(
+                    {"resource_metrics": process_resource_metrics(distributed)}
+                    if resource_monitoring_enabled
+                    else {}
+                ),
                 **{name: float(value.detach()) for name, value in losses.items()},
             }
             gathered_records = distributed.all_gather_objects(_jsonable(record))
@@ -2838,21 +3076,22 @@ def _run_flow_training_impl(
                 )
                 _write_jsonl(log_path, aggregated)
                 print(json.dumps(_jsonable(aggregated), sort_keys=True), flush=True)
-            enforce_cgroup_memory_guard(
-                distributed,
-                record["resource_metrics"],
-                memory_guard_fraction,
-            )
-            enforce_gpu_memory_guard(
-                distributed,
-                record["resource_metrics"],
-                gpu_memory_guard_fraction,
-            )
-            enforce_no_new_oom_events(
-                distributed,
-                record["resource_metrics"],
-                resource_baseline,
-            )
+            if resource_monitoring_enabled:
+                enforce_cgroup_memory_guard(
+                    distributed,
+                    record["resource_metrics"],
+                    memory_guard_fraction,
+                )
+                enforce_gpu_memory_guard(
+                    distributed,
+                    record["resource_metrics"],
+                    gpu_memory_guard_fraction,
+                )
+                enforce_no_new_oom_events(
+                    distributed,
+                    record["resource_metrics"],
+                    resource_baseline,
+                )
         if step % save_freq == 0 or step in {max_steps, stop_step}:
             rng_state_by_rank = distributed.all_gather_objects(local_rng_state(distributed))
             local_sampler_state = sampler.state_dict() if isinstance(
@@ -2881,15 +3120,7 @@ def _run_flow_training_impl(
             distributed.barrier()
             early_stopping_state = None
             if distributed.is_main:
-                validation_record = evaluate_flow_model(
-                    cfg,
-                    raw_model,
-                    validation_dataloader,
-                    stage=stage,
-                    step=step,
-                )
-                _write_jsonl(validation_log_path, validation_record)
-                print(json.dumps(_jsonable(validation_record), sort_keys=True), flush=True)
+                run_validation(step)
                 if early_stopping_enabled:
                     early_stopping_state = validation_loss_early_stopping_state(
                         _read_jsonl_records(validation_log_path),
@@ -2898,19 +3129,50 @@ def _run_flow_training_impl(
                         min_delta=early_stopping_min_delta,
                         patience=early_stopping_patience,
                         min_steps=early_stopping_min_steps,
+                        validation_mode=early_stopping_mode,
+                        min_unique_episodes=min_validation_episodes,
                     )
             early_stopping_state = distributed.broadcast_object(early_stopping_state)
             distributed.barrier()
-            validation_resources = process_resource_metrics(distributed)
-            enforce_cgroup_memory_guard(
-                distributed, validation_resources, memory_guard_fraction
-            )
-            enforce_gpu_memory_guard(
-                distributed, validation_resources, gpu_memory_guard_fraction
-            )
-            enforce_no_new_oom_events(
-                distributed, validation_resources, resource_baseline
-            )
+            if resource_monitoring_enabled:
+                validation_resources = process_resource_metrics(distributed)
+                enforce_cgroup_memory_guard(
+                    distributed, validation_resources, memory_guard_fraction
+                )
+                enforce_gpu_memory_guard(
+                    distributed, validation_resources, gpu_memory_guard_fraction
+                )
+                enforce_no_new_oom_events(
+                    distributed, validation_resources, resource_baseline
+                )
+            if early_stopping_state and bool(
+                early_stopping_state.get("current_is_best", False)
+            ):
+                rng_state_by_rank = distributed.all_gather_objects(
+                    local_rng_state(distributed)
+                )
+                local_sampler_state = sampler.state_dict() if isinstance(
+                    sampler, EpisodeAwareDistributedSampler
+                ) else None
+                sampler_state_by_rank = distributed.all_gather_objects(
+                    local_sampler_state
+                )
+                if distributed.is_main:
+                    save_flow_checkpoint(
+                        output_dir / "checkpoint_best.pt",
+                        raw_model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        step,
+                        cfg,
+                        stage,
+                        schedule_state,
+                        distributed_metadata=cfg["distributed_contract"],
+                        rng_state_by_rank=rng_state_by_rank,
+                        sampler_state_by_rank=sampler_state_by_rank,
+                    )
+                distributed.barrier()
             if (
                 early_stopping_state
                 and bool(early_stopping_state["should_stop"])
@@ -2961,6 +3223,8 @@ def _run_flow_training_impl(
             min_delta=early_stopping_min_delta,
             patience=early_stopping_patience,
             min_steps=early_stopping_min_steps,
+            validation_mode=early_stopping_mode,
+            min_unique_episodes=min_validation_episodes,
         ) if early_stopping_enabled else {}
         _write_json_atomic(
             early_stopping_report_path,
