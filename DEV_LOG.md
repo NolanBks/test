@@ -40,22 +40,58 @@
 - 一键入口现永久关闭资源 telemetry：不读取 `/proc`/cgroup、RSS、OOM event 或 GPU memory，不运行 feature-store soak、resource runtime audit 或 resource readiness；数据、等价性、checkpoint、validation、early stopping 和 Stage 1 质量门保持启用。
 - raw/cache equivalence 的 raw matcher 现优先使用 formal store 已记录的精确 `(source_file_key, source_traj_index, step_id)`，只有旧 store 缺少该 provenance 时才回退图像摘要 `episode_id`；这修复跨服务器同计数/同 manifest 下的少量 image-fingerprint missing pair，不会放宽 100/100 gate。
 - 真实 8×GPU Stage 1 step 0→2 首次运行在完成 step 1 后触发 DDP unused-parameter reducer 错误；参数索引已精确映射为 nominal trunk 的可选 `token_condition_projection` 与 Stage-1 无监督的 `world_model.route_world_head`，stage 配置现按真实梯度路径冻结它们，Stage 2/3 会重新启用 route-world head。
+- 修正版 `v2` 已在真实 8 卡节点完成 Stage 1：step 47,500 发生合规 deployment plateau early stop，best checkpoint 为 step 45,000，episode-balanced validation 覆盖 78 个 episode；H=4/8/16 相对 `copy_current` 为 `-3.89%/+37.68%/+57.68%`，平均 `+30.49%`。旧门禁仅因 H=4 的轻微回退阻塞 Stage 2；当前代码已改为平均改善≥10% 且任一尺度回退≤5%，服务器尚未重跑新门禁。
 - 本地 CALVIN `dataset/Calvin_rlds` 512/512 shard 全量 SHA-256/schema/action/skill 审计已通过：17,870 records、1,071,807 frames、785,887 H=16 windows、unknown=0；`start_mtp_calvin.py` 已完成真实本地路径 dry-run，全链展开 conversion→audit/equivalence→Stage 1/2/3 resume。
 
 ### 尚未完成
 
-- 修正后的 launcher 尚未在服务器重新运行；因此还没有 episode-balanced deployment validation、step≥35,000 early-stopping 或 `checkpoint_best.pt` 的真实 GPU 证据。
-- 原始-backbone新 lineage 的修正版 step 0→2→25→100→1000→最多50000 DDP Stage 1 链路。
-- Stage 1 future predictor 在至少 32 个不同 validation episode 上明确优于 `copy_current`。
+- 在服务器同步当前门禁代码并对现有 `v2` 重跑 `mowe_stage1_quality_gate_v3`；本地真实数值重放已通过，但不能替代服务器报告。
+- `v2` 的 Stage 2/3 真实 8 卡训练与 predecessor/resume 证据。
 - Stage 3 真实 optimizer/resume、LIBERO 四 suite 正式结果和机制消融。
 - CALVIN 原始-backbone formal feature store、100-window equivalence、8-GPU 三阶段训练及 D 环境官方 1,000-sequence 评测。
 
 ### 下一步
 
-1. 将本次修正版 repo 同步到目标 8 卡节点，用新的 `run-id` 执行 `start_mtp.py --dry-run`；不要把旧 Stage 2/3 checkpoint 接到改变后的 Stage 1 predecessor。
-2. 去掉 `--dry-run` 从 step 0 建立修正版正式 lineage，并确认 validation 记录中 `sampling_contract=episode_balanced_deterministic_v1`、`validation_mode=deployment`、`unique_episodes>=32`。
-3. Stage 1 只在 `checkpoint_best.pt` 的 `mowe_stage1_quality_gate_v2` 通过后进入 Stage 2；默认 50,000-step 合同不得在 step 35,000 前早停。
-4. 资源配额与告警完全由 MTP/云平台承担；一键命令不再接受或需要任何 monitoring 参数。
+1. 将当前门禁修正版同步到目标 8 卡节点，保持 `run-id=libero_original_openvla_h16_v2`，重新执行原正式一键命令；不要删除或重训已完成的 Stage 1。
+2. 确认 `reports/stage1_quality_gate.json` 为 `mowe_stage1_quality_gate_v3`、`passed=true`、`validation_step=45000`，随后由 launcher 自动启动 Stage 2。
+3. Stage 2/3 继续保持 predecessor identity、deployment-only schedule-aware early stop 和完整 same-stage resume 合同。
+4. 资源配额与告警完全由 MTP/云平台承担；一键命令不接受或需要任何 monitoring 参数。
+
+## 2026-07-19 - 按真实 Stage 1 多尺度结果修正晋级门禁
+
+### Goal
+
+判断真实 `v2` Stage 1 是否需要重训，并修复 H=4 小幅回退导致中长时域明显改善仍无法进入 Stage 2 的门禁误判。
+
+### Changed
+
+- 将 Stage 1 质量门从“三个 horizon 均不得退化”改为“三尺度平均改善至少 10%，任一尺度相对回退不超过 5%”；报告格式升级为 `mowe_stage1_quality_gate_v3`。
+- LIBERO 与 CALVIN launcher 的默认单尺度最低改善统一为 `-0.05`；episode diversity、deployment sampling、action gate、view fusion、平均改善和 checkpoint-best 选择均保持 fail closed。
+- 用服务器 step 45,000 的真实 H=4/8/16 数值增加回归测试，并增加单尺度回退超过 5% 时仍应拒绝的反例。
+- 一键训练文档写明当前 `v2` 不需要重训 Stage 1；同步代码后重新运行同一正式命令即可重新验门并继续 Stage 2。
+
+### Commands Run
+
+```bash
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -p 'test_start_mtp.py' -v
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -p 'test_start_mtp_calvin.py' -v
+/Users/tt/miniconda3/envs/mowe/bin/python -m compileall -q start_mtp.py start_mtp_calvin.py tests/test_start_mtp.py
+git diff --check
+```
+
+### Result
+
+- 真实 best checkpoint 的 H=4/8/16 改善为 `-3.89%/+37.68%/+57.68%`，平均约 `+30.49%`；本地门禁数值重放通过。
+- 将 H=4 构造成约 `-6.59%` 回退后，即使三尺度平均仍超过 10%，门禁按预期拒绝。
+- LIBERO launcher 5 项、CALVIN launcher 1 项测试、compileall 和 `git diff --check` 均通过。
+
+### Issues
+
+- 新 `v3` 门禁尚未在服务器对现有 `v2` 输出重新执行；Stage 2 仍未启动，不能把本地重放表述为服务器阶段晋级已经完成。
+
+### Next
+
+- 同步当前代码到服务器，保持原 `libero_original_openvla_h16_v2` 命令与参数不变重新提交，确认报告 `passed=true` 且 `validation_step=45000` 后让 launcher 自动进入 Stage 2。
 
 ## 2026-07-19 - CALVIN ABC RLDS 全量数据合同与一键三阶段入口
 

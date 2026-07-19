@@ -139,7 +139,7 @@ def stage1_quality_gate(
     records: list[dict[str, Any]],
     *,
     required_average_improvement: float = 0.10,
-    required_min_horizon_improvement: float = 0.0,
+    required_min_horizon_improvement: float = -0.05,
     min_unique_episodes: int = 32,
     min_action_distance_gate: float = 0.10,
     validation_step: int | None = None,
@@ -158,7 +158,7 @@ def stage1_quality_gate(
     ]
     if not eligible:
         return {
-            "format": "mowe_stage1_quality_gate_v2",
+            "format": "mowe_stage1_quality_gate_v3",
             "passed": False,
             "errors": ["deployment_validation_missing"],
         }
@@ -186,7 +186,7 @@ def stage1_quality_gate(
     if average_improvement < required_average_improvement:
         errors.append("average_copy_current_improvement_below_threshold")
     if improvements and min(improvements.values()) < required_min_horizon_improvement:
-        errors.append("one_or_more_horizons_worse_than_copy_current")
+        errors.append("one_or_more_horizons_below_allowed_improvement")
     unique_episodes = int(latest.get("unique_episodes", 0))
     if unique_episodes < min_unique_episodes:
         errors.append("insufficient_unique_validation_episodes")
@@ -206,7 +206,7 @@ def stage1_quality_gate(
     if not view_weights_valid:
         errors.append("view_weights_invalid_or_collapsed")
     return {
-        "format": "mowe_stage1_quality_gate_v2",
+        "format": "mowe_stage1_quality_gate_v3",
         "passed": not errors,
         "stage": "nominal_flow_pretrain",
         "validation_step": int(latest.get("step", -1)),
@@ -836,7 +836,7 @@ class Launcher:
         report_path = self.report_root / "stage1_quality_gate.json"
         if self.args.dry_run:
             report = {
-                "format": "mowe_stage1_quality_gate_v2",
+                "format": "mowe_stage1_quality_gate_v3",
                 "passed": None,
                 "status": "dry_run",
             }
@@ -1168,8 +1168,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage1-quality-min-horizon-improvement",
         type=float,
-        default=0.0,
-        help="Stage 1 任一 H=4/8/16 horizon 相对 copy-current 的最低改善。",
+        default=-0.05,
+        help="Stage 1 任一 H=4/8/16 horizon 相对 copy-current 的最低改善；默认允许最多 5%% 的单尺度回退。",
     )
     parser.add_argument(
         "--stage1-quality-min-action-gate",

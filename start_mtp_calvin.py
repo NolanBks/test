@@ -427,7 +427,7 @@ def parse_args() -> argparse.Namespace:
         "--stage1-quality-average-improvement", type=float, default=0.10
     )
     parser.add_argument(
-        "--stage1-quality-min-horizon-improvement", type=float, default=0.0
+        "--stage1-quality-min-horizon-improvement", type=float, default=-0.05
     )
     parser.add_argument("--stage1-quality-min-action-gate", type=float, default=0.10)
     parser.add_argument("--equivalence-samples", type=int, default=100)

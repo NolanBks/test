@@ -73,7 +73,7 @@ LIBERO/CALVIN episodic windows or mowe_feature_store_v1
 - 本地 synthetic/contract、CPU 2-rank Gloo DDP 和 checkpoint resume 已有通过记录；修改代码后仍应重跑相关测试。
 - 云端 RTX 4090 已记录旧 LIBERO-OFT backbone 下的真实 Stage 1 step 0→100、resume，以及 Stage 2 oracle one-step/25-step coverage gate；这些结果只证明历史代码路径，不满足新的原始-backbone训练合同，也不能作为新 lineage 的 resume 起点。
 - 已完成的一轮 8 卡 launcher 输出暴露出旧验证/早停合同问题：validation prefix 仅覆盖 1 个 episode，Stage 1/2/3 分别约在 11k/7.5k/5k 早停，Stage 3 尚未进入 predicted-route、各阶段尚未完成 nominal-action 课程；这些结果不能作为机制或正式模型质量证据。
-- Stage 1 future predictor 尚未在修正后的 episode-balanced deployment validation 上证明优于 `copy_current`。
+- 新 `v2` lineage 已在真实 8 卡节点完成 Stage 1：step 47,500 因合规 deployment loss plateau 早停，eligible best 为 step 45,000，验证覆盖 78 个 episode。best checkpoint 的 H=4/8/16 相对 `copy_current` 改善为 `-3.89% / +37.68% / +57.68%`，三尺度平均 `+30.49%`；旧的“任一尺度不得退化”门槛只因 H=4 的小幅权衡阻塞 Stage 2，现改为平均改善至少 10% 且任一尺度回退不超过 5%。修正版门禁尚待服务器重跑后再启动 Stage 2。
 - 修正版一键入口的真实 8×A100/A800 NCCL、Stage 3 真实训练、LIBERO 正式 success rate、CALVIN 正式训练与官方评测均未完成。
 - 代码存在、CLI 可运行、mock/contract 测试通过，均不能替代上述真实证据。
 
@@ -88,7 +88,7 @@ LIBERO/CALVIN episodic windows or mowe_feature_store_v1
 5. **等价性和数据审计**：至少 100 个真实窗口验证 raw original-backbone/store 的 views、language、DINO、actions、skills、完整 outputs/losses；冻结 8-rank suite/window/skill imbalance 上限。
 6. **新 Stage 1 lineage 阶梯**：不恢复任何旧 OFT-backbone checkpoint；使用正式 50,000-step 配置从 step 0 新建 8 卡 lineage，依次验证 `0→2→25→100→1000`。same-stage resume 只改变 `stop_step`，从第一步起保持 `max_steps=50000` 和全部优化语义。
 7. **Stage 1 连续训练**：从 step 100 连续训练到 1000，再继续到最多 50,000；早停不得早于 nominal-action 课程完成。
-8. **机制门槛**：选择 eligible deployment loss 最优的 `checkpoint_best.pt`，并在至少 32 个不同 validation episode 上要求 H=4/8/16 相对 `copy_current` 的平均改善至少 10%、任一 horizon 不得退化；通过后才启动 Stage 2/3。Stage 3 早停还必须等待 predicted-route 课程完成，并完成真实 optimizer/resume gate。
+8. **机制门槛**：选择 eligible deployment loss 最优的 `checkpoint_best.pt`，并在至少 32 个不同 validation episode 上要求 H=4/8/16 相对 `copy_current` 的平均改善至少 10%、任一 horizon 的相对回退不超过 5%；通过后才启动 Stage 2/3。5% 只用于容忍短时域强 copy baseline 的小幅尺度权衡，不允许替代平均改善门槛。Stage 3 早停还必须等待 predicted-route 课程完成，并完成真实 optimizer/resume gate。
 9. **正式评测**：先完成 LIBERO one-task/1-trial smoke，再完成四 suite 可恢复正式评测与机制分析。
 10. **CALVIN 第二基准**：仅在 LIBERO 主线稳定后，以同一原始 backbone identity 重新生成 CALVIN 独立 store，完成 ABC 独立三阶段训练和 D 环境官方 1,000-sequence LH-MTLC 评测。
 

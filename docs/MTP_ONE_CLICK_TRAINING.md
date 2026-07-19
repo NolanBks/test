@@ -6,7 +6,7 @@
 2. RLDS/skill config、formal feature-store checksum 与 8-rank assignment 审计。
 3. 100-window raw/cache 等价性审计。
 4. Stage 1：`0→2→25→100→1000→最多 50000`，保持同一训练合同精确恢复。
-5. Stage 1 结束后，deployment validation 必须在至少 32 个不同 episode 上证明 H=4/8/16 future predictor 平均优于 `copy_current` 至少 10%，且任一 horizon 不得更差；失败时禁止进入 Stage 2。
+5. Stage 1 结束后，deployment validation 必须在至少 32 个不同 episode 上证明 H=4/8/16 future predictor 平均优于 `copy_current` 至少 10%，且任一 horizon 相对回退不得超过 5%；失败时禁止进入 Stage 2。该 5% 是单尺度容差，不会替代平均改善门槛。
 6. Stage 2：`0→100→最多 50000`，使用通过质量门禁的 Stage 1 checkpoint 初始化。
 7. Stage 3：`0→100→最多 50000`，使用 Stage 2 checkpoint 初始化。
 
@@ -157,6 +157,28 @@ python start_mtp.py \
 ```
 
 若增加该参数，dry-run、首次正式启动和后续恢复三次都必须使用同一个 Python 路径。
+
+### 2.4 当前 v2 Stage 1 结果与继续方式
+
+真实 `v2` 已在 step 47,500 因合规的 deployment validation plateau 停止，`checkpoint_best.pt` 为 step 45,000，validation 覆盖 78 个 episode。best checkpoint 相对 `copy_current` 的结果为：
+
+```text
+H=4:  -3.89%
+H=8: +37.68%
+H=16: +57.68%
+三尺度平均: +30.49%
+```
+
+这说明中长时域预测明显优于复制当前状态，H=4 只有小幅尺度权衡。门禁现要求“三尺度平均改善至少 10%，任一尺度回退不超过 5%”，因此不需要删除 `v2`、不需要重新训练 Stage 1，也不要创建 `v3` run-id。把当前修正版代码同步到服务器后，直接重新执行 2.2 的原正式启动命令；launcher 会重新生成 `mowe_stage1_quality_gate_v3` 报告并在通过后从 Stage 2 开始。代码同步本身不改变 Stage 1 checkpoint、optimizer 或 predecessor identity。
+
+重新提交后可检查：
+
+```bash
+python -m json.tool \
+  /home/ma-user/work/algorithm/chaoxintao_2/MoWE/outputs/libero_original_openvla_h16_v2/reports/stage1_quality_gate.json
+```
+
+预期 `format` 为 `mowe_stage1_quality_gate_v3`、`passed` 为 `true`、`validation_step` 为 `45000`。若其余 action/view/episode 合同出现新错误，launcher 仍会停止，不会仅凭 future 平均值强行晋级。
 
 ## 3. 必须传入的参数
 

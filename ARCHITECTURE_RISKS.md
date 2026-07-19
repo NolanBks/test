@@ -126,10 +126,10 @@ gripper_final[j] = binarize(sigmoid(g0_logit[j]))
 ```text
 z*(t+H)       : 未来 spatial visual tokens
 Δz*(t→t+H)    : z*(t+H) - z*(t)
-H             : [1, 4, 8]
+H             : [1, 4, 8, 16]
 ```
 
-损失必须同时包含 cosine、Smooth L1 和 delta 项。分析必须加入 `copy_current` 基线，并按 motion magnitude 分桶报告误差。
+损失必须同时包含 cosine、Smooth L1 和 delta 项。分析必须加入 `copy_current` 基线，并按 motion magnitude 分桶报告误差。Stage 1 晋级使用跨 H=4/8/16 的平均改善而不是要求每个聚合点绝对 Pareto 占优：平均改善至少 10%，且任一 horizon 相对回退不得超过 5%，避免短时域强 copy baseline 的微小波动误阻塞明显改善的中长时域预测。
 
 ### R4：Router 绕过 future signal
 

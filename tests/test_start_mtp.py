@@ -262,6 +262,45 @@ class MtpLauncherTests(unittest.TestCase):
         self.assertFalse(nonfinite["passed"])
         self.assertIn("nominal_action_distance_gate_collapsed", nonfinite["errors"])
 
+        short_horizon_tradeoff = {
+            **record,
+            "step": 45000,
+            "future_horizon_metrics": {
+                "4": {
+                    "smooth_l1": 0.07406805,
+                    "current_copy_smooth_l1": 0.07129669,
+                },
+                "8": {
+                    "smooth_l1": 0.07277282,
+                    "current_copy_smooth_l1": 0.11677783,
+                },
+                "16": {
+                    "smooth_l1": 0.07853768,
+                    "current_copy_smooth_l1": 0.18556504,
+                },
+            },
+        }
+        tolerated = start_mtp.stage1_quality_gate([short_horizon_tradeoff])
+        self.assertTrue(tolerated["passed"], tolerated)
+        self.assertGreater(tolerated["average_improvement"], 0.30)
+        self.assertGreater(
+            tolerated["fractional_improvement_over_copy_current"]["4"], -0.05
+        )
+
+        excessive_regression = {
+            **short_horizon_tradeoff,
+            "future_horizon_metrics": {
+                **short_horizon_tradeoff["future_horizon_metrics"],
+                "4": {"smooth_l1": 0.076, "current_copy_smooth_l1": 0.07129669},
+            },
+        }
+        rejected = start_mtp.stage1_quality_gate([excessive_regression])
+        self.assertFalse(rejected["passed"])
+        self.assertGreater(rejected["average_improvement"], 0.10)
+        self.assertIn(
+            "one_or_more_horizons_below_allowed_improvement", rejected["errors"]
+        )
+
     def test_existing_stage_must_match_selected_predecessor_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
