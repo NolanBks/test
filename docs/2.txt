@@ -1,0 +1,114 @@
+是路径/解释器的小问题，和 OSMesa、Conda 是否安装无关。最可能的情况是：
+
+- 你当前激活的 Conda 环境能找到 LIBERO；
+- 但评测文档固定使用 `.../envs/mowe/bin/python`；
+- 或者 `PYTHONPATH` 加错了一层；
+- MTP 新任务启动后，之前设置的 `PYTHONPATH` 丢失了。
+
+先在服务器执行下面这段，只做路径诊断：
+
+```bash
+export MOWE_PYTHON=/opt/huawei/explorer-env/dataset/Common_wl/miniconda3/envs/mowe/bin/python
+export MOWE_REPO_ROOT=/home/ma-user/work/algorithm/chaoxintao_2/MoWE/MoWE
+
+echo "当前 Conda 环境: ${CONDA_PREFIX:-未激活}"
+echo "当前 python: $(command -v python)"
+echo "评测 python: $MOWE_PYTHON"
+
+python -c 'import sys; print("current =", sys.executable)'
+"$MOWE_PYTHON" -c 'import sys; print("mowe =", sys.executable)'
+
+echo "当前环境检查 LIBERO："
+python -c 'from libero.libero import benchmark; print("current python: LIBERO OK")' || true
+
+echo "mowe 环境检查 LIBERO："
+"$MOWE_PYTHON" -c 'from libero.libero import benchmark; print("mowe python: LIBERO OK")' || true
+```
+
+如果第一条成功、第二条失败，说明 LIBERO 安装在另一个 Conda 环境。最简单的解决方式是使用当前能导入 LIBERO 的环境，但先确认它也有模型依赖：
+
+```bash
+export MOWE_PYTHON="$(command -v python)"
+
+cd "$MOWE_REPO_ROOT"
+
+"$MOWE_PYTHON" - <<'PY'
+import sys
+import torch
+import mujoco
+import OpenGL
+from libero.libero import benchmark
+import mowe_wam
+
+print("Python:", sys.executable)
+print("Torch:", torch.__version__)
+print("LIBERO suites:", sorted(benchmark.get_benchmark_dict()))
+print("全部依赖检查通过")
+PY
+```
+
+全部通过后，就可以继续使用这个 `MOWE_PYTHON` 运行评测。
+
+如果两个解释器都不能导入，但服务器上确实存在 LIBERO 源码，执行：
+
+```bash
+LIBERO_INIT="$(find /home/ma-user/work/algorithm/chaoxintao_2/MoWE \
+  -type f -path '*/libero/libero/__init__.py' \
+  -print -quit)"
+
+echo "找到的 LIBERO 文件: $LIBERO_INIT"
+```
+
+如果输出类似：
+
+```text
+/home/ma-user/work/algorithm/chaoxintao_2/MoWE/LIBERO/libero/libero/__init__.py
+```
+
+则自动计算正确的导入根目录：
+
+```bash
+export LIBERO_IMPORT_ROOT="$(
+  dirname "$(dirname "$(dirname "$LIBERO_INIT")")"
+)"
+
+export PYTHONPATH="$LIBERO_IMPORT_ROOT:$MOWE_REPO_ROOT/external/openvla-oft:${PYTHONPATH:-}"
+
+echo "LIBERO_IMPORT_ROOT=$LIBERO_IMPORT_ROOT"
+echo "PYTHONPATH=$PYTHONPATH"
+
+"$MOWE_PYTHON" -c '
+import sys
+from libero.libero import benchmark
+print("Python:", sys.executable)
+print("LIBERO:", sorted(benchmark.get_benchmark_dict()))
+print("LIBERO 路径修复成功")
+'
+```
+
+注意这里应加入包含第一层 `libero` 目录的父目录。不要直接把最后面的：
+
+```text
+.../libero/libero
+```
+
+加入 `PYTHONPATH`，否则 `from libero.libero import benchmark` 仍然找不到。
+
+如果 `pip show` 能找到但 import 失败，再检查是不是装到了不同解释器或 editable 路径已经失效：
+
+```bash
+python -m pip show libero || true
+"$MOWE_PYTHON" -m pip show libero || true
+```
+
+最终请把这些变量放在每一个新 MTP 评测任务的开头，因为新任务通常不会继承上一次 shell 的变量：
+
+```bash
+export MOWE_PYTHON=实际验证通过的python路径
+export PYTHONPATH="$LIBERO_IMPORT_ROOT:$MOWE_REPO_ROOT/external/openvla-oft:${PYTHONPATH:-}"
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
+export LIBGL_ALWAYS_SOFTWARE=1
+```
+
+所以，`line 25: No module named 'libero'` 基本不是代码错误；它表示执行第 25 行导入时，当前指定的 Python 的 `sys.path` 中没有正确的 LIBERO 根目录。
