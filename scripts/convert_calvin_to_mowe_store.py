@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert official CALVIN ABC language segments to mowe_feature_store_v1."""
+"""Convert CALVIN ABC train (official NPZ or RLDS) to mowe_feature_store_v1."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from mowe_wam.backbones import (
     resolve_original_openvla_identity,
     teacher_transform_metadata,
 )
-from mowe_wam.benchmarks.calvin import CalvinActionAdapter, CalvinLanguageSegmentDataset
+from mowe_wam.benchmarks.calvin import CalvinActionAdapter, resolve_calvin_training_dataset
 from mowe_wam.data import (
     MoWECanonicalArchiveWriter,
     MoWEFeatureStoreWriter,
@@ -36,6 +36,11 @@ def parse_args():
     parser.add_argument("--config", default="configs/mowe_wam/train_nominal_flow_wam.yaml")
     parser.add_argument("--benchmark-config", default="configs/mowe_wam/calvin_abc_d.yaml")
     parser.add_argument("--dataset-root", required=True)
+    parser.add_argument(
+        "--dataset-format",
+        choices=["auto", "official_npz", "rlds"],
+        default="auto",
+    )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--backbone-revision", required=True)
     parser.add_argument("--teacher-checkpoint", required=True)
@@ -152,8 +157,9 @@ def main() -> None:
     cfg = load_config(args.config)
     benchmark_cfg = load_config(args.benchmark_config)
     official_commit = benchmark_cfg["benchmark"]["official_repo_commit"]
-    dataset = CalvinLanguageSegmentDataset(
+    dataset = resolve_calvin_training_dataset(
         args.dataset_root,
+        dataset_format=args.dataset_format,
         min_segment_length=max(
             int(cfg["data"].get("action_chunk_size", 16)),
             max(
@@ -243,7 +249,9 @@ def main() -> None:
         "fingerprint_sha256": dataset.annotation_fingerprint,
         "label_version": audit["label_version"],
         "alignment_verified": False,
-        "join_key": "auto_lang_ann.info.indx inclusive segment",
+        "join_key": dataset.skill_config(
+            audit, audit_path=str(audit_path.resolve())
+        )["join_key"],
     }
     transform = teacher_transform_metadata(
         args.teacher_checkpoint,
@@ -253,7 +261,7 @@ def main() -> None:
     source_contract = {
         "dataset_contract": audit["dataset_contract"],
         "dataset_fingerprint": dataset.dataset_fingerprint,
-        "dataset_names": ["calvin_abc_language_segments"],
+        "dataset_names": [dataset.dataset_name],
         "official_repo_commit": official_commit,
         "train_eval_isolation": audit["train_eval_isolation"],
         "annotation_fingerprint": dataset.annotation_fingerprint,
@@ -265,7 +273,7 @@ def main() -> None:
         "expected_counts": {
             "episode_count": int(audit["segments"]),
             "frame_count": int(audit["transitions"]),
-            "window_count": int(audit["valid_windows_h8"]),
+            "window_count": int(audit["valid_windows"]),
         },
         "openvla_checkpoint": str(args.checkpoint),
         "openvla_identity": backbone_identity,
@@ -325,10 +333,7 @@ def main() -> None:
             validation_fraction=validation_fraction,
             split_seed=split_seed,
         )
-        source_file_key = (
-            f"{dataset.frame_path(segment['start_frame'])}:"
-            f"{dataset.frame_path(segment['end_frame']).name}"
-        )
+        source_file_key = dataset.source_file_key(segment)
         encoded = None
         if needs_feature:
             encoded = _encode_segment(
@@ -336,7 +341,7 @@ def main() -> None:
             )
             writer.add_episode(
                 episode_id=episode_id,
-                dataset_name="calvin_abc_language_segments",
+                dataset_name=dataset.dataset_name,
                 partition=partition,
                 language=segment["language"],
                 language_feature=encoded["language_feature"],
@@ -358,7 +363,7 @@ def main() -> None:
                 skills = encoded["skills"]
             canonical_writer.add_episode(
                 episode_id=episode_id,
-                dataset_name="calvin_abc_language_segments",
+                dataset_name=dataset.dataset_name,
                 partition=partition,
                 language=segment["language"],
                 actions=shared_actions,

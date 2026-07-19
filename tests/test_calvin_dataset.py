@@ -2,23 +2,41 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import io
 from pathlib import Path
 
 import numpy as np
 import torch
+import tensorflow as tf
+from PIL import Image
 
 from mowe_wam.benchmarks.calvin import CalvinActionAdapter
 from mowe_wam.benchmarks.calvin.dataset import (
     CalvinLanguageSegmentDataset,
+    CalvinRLDSEpisodeDataset,
+    label_calvin_instruction,
     resolve_calvin_abc_training_root,
 )
 from scripts.convert_calvin_to_mowe_store import _encode_segment
 from scripts.audit_calvin_feature_store_equivalence import (
     _window_from_encoded_segment,
 )
+from mowe_wam.training.flow_runtime import validate_skill_config
 
 
 class CalvinDatasetTests(unittest.TestCase):
+    def test_calvin_paraphrase_mapping_preserves_motor_taxonomy(self):
+        cases = {
+            "go towards the drawer and place the object": 1,
+            "in the cabinet pick up the red block": 0,
+            "collapse the stacked blocks": 0,
+            "slide the door to the left": 5,
+            "store the object in the drawer": 1,
+            "toggle the light switch": 3,
+        }
+        for instruction, expected in cases.items():
+            self.assertEqual(label_calvin_instruction(instruction)[0], expected)
+
     @staticmethod
     def _build_dataset(root: Path) -> Path:
         training = root / "task_ABC_D/training"
@@ -80,6 +98,7 @@ class CalvinDatasetTests(unittest.TestCase):
             report = dataset.audit()
             self.assertTrue(report["passed"], report)
             self.assertEqual(report["transitions"], 54)
+            self.assertEqual(report["valid_windows"], 6)
             self.assertEqual(report["valid_windows_h8"], 6)
             self.assertEqual(report["unknown_ratio"], 0.0)
             self.assertTrue(report["all_motor_classes_present"])
@@ -113,6 +132,83 @@ class CalvinDatasetTests(unittest.TestCase):
                 resolve_calvin_abc_training_root(other.parent)
             with self.assertRaisesRegex(ValueError, "task_ABC_D"):
                 resolve_calvin_abc_training_root(other)
+
+    @staticmethod
+    def _png(shape, value):
+        buffer = io.BytesIO()
+        Image.fromarray(np.full(shape, value, dtype=np.uint8)).save(
+            buffer, format="PNG"
+        )
+        return buffer.getvalue()
+
+    def test_rlds_schema_audit_checksum_and_h16_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            verbs = ["pick", "place", "move", "open", "turn", "push"]
+            writers = [
+                tf.io.TFRecordWriter(
+                    str(root / f"calvin_abc-train.tfrecord-{index:05d}-of-00002")
+                )
+                for index in range(2)
+            ]
+            try:
+                for episode_id, verb in enumerate(verbs):
+                    length = 17
+                    actions = np.zeros((length, 7), dtype=np.float32)
+                    actions[:, :6] = np.linspace(-0.5, 0.5, length)[:, None]
+                    actions[:, :6] += np.arange(6, dtype=np.float32)[None] * 0.001
+                    actions[:, 6] = np.where(np.arange(length) % 2, 1.0, -1.0)
+                    static = self._png((200, 200, 3), episode_id)
+                    wrist = self._png((84, 84, 3), episode_id)
+                    feature = {
+                        "episode_metadata/episode_id": tf.train.Feature(
+                            int64_list=tf.train.Int64List(value=[episode_id])
+                        ),
+                        "steps/action": tf.train.Feature(
+                            float_list=tf.train.FloatList(value=actions.reshape(-1))
+                        ),
+                        "steps/language_instruction": tf.train.Feature(
+                            bytes_list=tf.train.BytesList(
+                                value=[f"{verb} the object".encode()] * length
+                            )
+                        ),
+                        "steps/metadata/episode_index": tf.train.Feature(
+                            int64_list=tf.train.Int64List(value=[episode_id] * length)
+                        ),
+                        "steps/observation/rgb_gripper": tf.train.Feature(
+                            bytes_list=tf.train.BytesList(value=[wrist] * length)
+                        ),
+                        "steps/observation/rgb_static": tf.train.Feature(
+                            bytes_list=tf.train.BytesList(value=[static] * length)
+                        ),
+                        "steps/observation/state": tf.train.Feature(
+                            float_list=tf.train.FloatList(value=np.zeros(length * 15))
+                        ),
+                    }
+                    example = tf.train.Example(
+                        features=tf.train.Features(feature=feature)
+                    )
+                    writers[episode_id % 2].write(example.SerializeToString())
+            finally:
+                for writer in writers:
+                    writer.close()
+
+            dataset = CalvinRLDSEpisodeDataset(root, expected_shards=2)
+            report = dataset.audit()
+            self.assertTrue(report["passed"], report)
+            self.assertTrue(report["shard_checksums_verified"])
+            self.assertEqual(report["segments"], 6)
+            self.assertEqual(report["transitions"], 102)
+            self.assertEqual(report["window_max_offset"], 16)
+            self.assertEqual(report["valid_windows_h16"], 6)
+            validate_skill_config(dataset.skill_config(report, audit_path="audit.json"))
+            segment = dataset.load_segment(next(dataset.iter_segment_records()))
+            self.assertEqual(segment["rgb_static"].shape, (17, 200, 200, 3))
+            self.assertEqual(segment["rgb_gripper"].shape, (17, 84, 84, 3))
+            self.assertEqual(segment["rel_actions"].shape, (17, 7))
+            self.assertEqual(
+                segment["episode_id"], "calvin_abc_rlds:000000:source000000"
+            )
 
     def test_segment_encoding_handles_official_camera_shapes(self):
         class ImageProcessor:

@@ -17,7 +17,7 @@ from mowe_wam.backbones import (
     openvla_identities_match,
     resolve_original_openvla_identity,
 )
-from mowe_wam.benchmarks.calvin import CalvinActionAdapter, CalvinLanguageSegmentDataset
+from mowe_wam.benchmarks.calvin import CalvinActionAdapter, resolve_calvin_training_dataset
 from mowe_wam.data import LatentWAMCollator, MoWEFeatureWindowDataset
 from mowe_wam.training.flow_runtime import (
     build_flow_policy,
@@ -42,6 +42,11 @@ def parse_args():
     )
     parser.add_argument("--store", required=True)
     parser.add_argument("--dataset-root", required=True)
+    parser.add_argument(
+        "--dataset-format",
+        choices=["auto", "official_npz", "rlds"],
+        default="auto",
+    )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--backbone-revision", required=True)
     parser.add_argument("--teacher-checkpoint", required=True)
@@ -74,7 +79,9 @@ def _sparse_prefix_indices(prefix_end: int, slots: int) -> list[int]:
     return [(slot * (prefix_end - 1)) // (slots - 1) for slot in range(slots)]
 
 
-def _window_from_encoded_segment(torch, encoded, segment, step_id, window_contract):
+def _window_from_encoded_segment(
+    torch, encoded, segment, step_id, window_contract, *, dataset_name=None
+):
     """Independently rebuild the map-style window from online encoded arrays."""
 
     import numpy as np
@@ -118,7 +125,7 @@ def _window_from_encoded_segment(torch, encoded, segment, step_id, window_contra
     return {
         "episode_id": str(segment["episode_id"]),
         "step_id": step_id,
-        "dataset_name": "calvin_abc_language_segments",
+        "dataset_name": dataset_name or "calvin_abc_language_segments",
         "language": str(segment["language"]),
         "current_visual_views": torch.from_numpy(views[step_id].copy()),
         "history_visual_views": torch.from_numpy(history_views.copy()),
@@ -213,8 +220,9 @@ def main() -> None:
     if not openvla_identities_match(source.get("openvla_identity"), requested_identity):
         raise RuntimeError("CALVIN equivalence checkpoint differs from the store OpenVLA identity.")
     benchmark_cfg = load_config(args.benchmark_config)
-    dataset = CalvinLanguageSegmentDataset(
+    dataset = resolve_calvin_training_dataset(
         args.dataset_root,
+        dataset_format=args.dataset_format,
         min_segment_length=max(
             int(cfg["data"]["action_chunk_size"]),
             max(int(value) for value in cfg["data"]["future_horizons"]) + 1,
@@ -310,7 +318,12 @@ def main() -> None:
                 if pair[0] != episode_id:
                     continue
                 raw_sample = _window_from_encoded_segment(
-                    torch, encoded, segment, pair[1], manifest["window_contract"]
+                    torch,
+                    encoded,
+                    segment,
+                    pair[1],
+                    manifest["window_contract"],
+                    dataset_name=dataset.dataset_name,
                 )
                 feature_errors = {
                     name: _tensor_error(raw_sample[name], cached_sample[name])

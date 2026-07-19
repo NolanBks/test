@@ -267,7 +267,7 @@ LIBERO 多 suite 适合预训练、基础 benchmark 和消融，但成功 demons
 
 在加入失败/扰动轨迹之前，uncertainty 只能称为预测不确定性，不能命名为 failure probability。
 
-CALVIN 被选定不代表当前已经可运行。代码已固定官方仓库 commit `fa03f01f19c65920e18cf37398a9ce859274af76`，并实现只接受 `task_ABC_D/training` 的 language-segment reader、ABC-only q01/q99 审计、feature-store converter、benchmark-specific raw/cache equivalence、独立 action/policy adapter 和三阶段 DDP8 配置；合成官方 schema、expected/actual segment-frame-window completion contract 与 partial-store 拒绝门禁已通过。统一 readiness gate 会按 manifest 强制 `calvin_abc_d` equivalence identity，不能复用 LIBERO 报告。真实数据版本、全量统计、转换吞吐、训练曲线和官方 simulator 仍未验证，R30 保持开放。正式接入必须继续审计以下契约：
+CALVIN 被选定不代表 benchmark 已经跑通。代码已固定官方仓库 commit `fa03f01f19c65920e18cf37398a9ce859274af76`，并实现官方 `task_ABC_D/training` NPZ reader 与 512-shard `calvin_abc` train RLDS reader、ABC-only q01/q99 审计、feature-store converter、benchmark-specific raw/cache equivalence、独立 action/policy adapter、三阶段 DDP8 配置及 `start_mtp_calvin.py`。本地真实 RLDS 全量审计已通过：512/512 shard checksum、17,870 records、1,071,807 frames、785,887 H=16 windows、六 motor 类与 unknown=0；70 个复用的 source episode id 已改用 `(shard, record_index, source_episode_id, timestep)` 消歧。统一 readiness gate 会按 manifest 强制 `calvin_abc_d` equivalence identity，不能复用 LIBERO 报告。原始-backbone formal conversion、100-window equivalence、训练曲线和官方 D simulator 仍未验证，R30 保持开放。正式接入必须继续审计以下契约：
 
 - `rgb_static` / `rgb_gripper` 到 primary/wrist 的预处理和 view order；
 - relative/absolute action mode、坐标系、position/rotation scaling、Euler/axis-angle 转换和 gripper sign；

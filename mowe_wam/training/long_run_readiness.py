@@ -219,7 +219,8 @@ def audit_long_run_readiness(
     )
     expected_benchmark = (
         "calvin_abc_d"
-        if source_dataset_names == {"calvin_abc_language_segments"}
+        if source_dataset_names
+        in ({"calvin_abc_language_segments"}, {"calvin_abc_rlds"})
         else "libero"
         if source_dataset_names
         and all("libero" in value.lower() for value in source_dataset_names)

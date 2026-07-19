@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit official CALVIN task_ABC_D/training and derive allowed action stats."""
+"""Audit CALVIN ABC train (official NPZ or RLDS) and derive action stats."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from mowe_wam.benchmarks.calvin.dataset import CalvinLanguageSegmentDataset
+from mowe_wam.benchmarks.calvin.dataset import resolve_calvin_training_dataset
 
 
 def _atomic_json(path: Path, payload) -> None:
@@ -26,6 +26,11 @@ def _atomic_json(path: Path, payload) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", required=True)
+    parser.add_argument(
+        "--dataset-format",
+        choices=["auto", "official_npz", "rlds"],
+        default="auto",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--skill-config-output")
     parser.add_argument("--min-segment-length", type=int, default=9)
@@ -35,8 +40,9 @@ def main() -> None:
         default="fa03f01f19c65920e18cf37398a9ce859274af76",
     )
     args = parser.parse_args()
-    dataset = CalvinLanguageSegmentDataset(
+    dataset = resolve_calvin_training_dataset(
         args.dataset_root,
+        dataset_format=args.dataset_format,
         min_segment_length=args.min_segment_length,
         official_repo_commit=args.official_repo_commit,
     )

@@ -66,7 +66,7 @@ LIBERO/CALVIN episodic windows or mowe_feature_store_v1
 - feature-store validation 使用确定性的 episode-balanced sparse sampler；正式 launcher 同时记录 diagnostic 与 deployment 两种验证，早停只使用 deployment loss，并等待动作/路由课程调度完成。
 - `checkpoint_best.pt`、Stage 1 `copy_current` 质量门和 Stage 2/3 predecessor identity 校验已实现；`checkpoint_latest.pt` 仍只用于精确 same-stage resume。
 - 可恢复 LIBERO full-suite evaluator。
-- CALVIN action/policy bridge、ABC dataset/converter、feature-store configs 和官方 evaluator bridge。
+- CALVIN action/policy bridge、官方 NPZ 与 512-shard ABC RLDS reader/converter、feature-store configs、`start_mtp_calvin.py` 和官方 evaluator bridge。
 
 ### 已有证据边界
 
@@ -174,6 +174,7 @@ LIBERO/CALVIN episodic windows or mowe_feature_store_v1
 ### CALVIN
 
 - Benchmark/action：`configs/mowe_wam/calvin_abc_d.yaml`
+- 一键转换/审计/训练：`start_mtp_calvin.py`、`docs/MTP_CALVIN_ONE_CLICK_TRAINING.md`
 - Stage 1：`configs/mowe_wam/ddp8_calvin_nominal_flow_feature_store.yaml`
 - Stage 2：`configs/mowe_wam/ddp8_calvin_warmstart_skill_flow_feature_store.yaml`
 - Stage 3：`configs/mowe_wam/ddp8_calvin_joint_flow_feature_store.yaml`
@@ -261,7 +262,7 @@ torchrun --standalone --nproc-per-node=8 scripts/pretrain_nominal_flow_wam.py \
 | 单机 DDP | 代码与 2-rank CPU contract 已完成 | 修正版一键入口 8-rank NCCL 实跑 |
 | Feature store/archive | 核心代码与正式 store/checksum 完成 | 保持数据审计通过 |
 | LIBERO evaluator | 代码完成 | one-task smoke 和四-suite 正式结果 |
-| CALVIN adapter/converter/evaluator | 代码与 synthetic contract 完成 | ABC 全量数据、训练、D 环境官方结果 |
+| CALVIN adapter/converter/evaluator | 本地 512-shard ABC RLDS 全量数据/标签/checksum 审计通过；一键转换与三阶段 dry-run contract 完成 | 原始-backbone formal store、100-window equivalence、8-GPU 三阶段训练、D 环境官方结果 |
 | 消融实验 | 本轮暂缓；已有配置保留 | 主训练与双 benchmark 稳定后再排期 |
 
 ## 8. 长训练 Definition of Ready

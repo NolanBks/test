@@ -40,6 +40,7 @@
 - 一键入口现永久关闭资源 telemetry：不读取 `/proc`/cgroup、RSS、OOM event 或 GPU memory，不运行 feature-store soak、resource runtime audit 或 resource readiness；数据、等价性、checkpoint、validation、early stopping 和 Stage 1 质量门保持启用。
 - raw/cache equivalence 的 raw matcher 现优先使用 formal store 已记录的精确 `(source_file_key, source_traj_index, step_id)`，只有旧 store 缺少该 provenance 时才回退图像摘要 `episode_id`；这修复跨服务器同计数/同 manifest 下的少量 image-fingerprint missing pair，不会放宽 100/100 gate。
 - 真实 8×GPU Stage 1 step 0→2 首次运行在完成 step 1 后触发 DDP unused-parameter reducer 错误；参数索引已精确映射为 nominal trunk 的可选 `token_condition_projection` 与 Stage-1 无监督的 `world_model.route_world_head`，stage 配置现按真实梯度路径冻结它们，Stage 2/3 会重新启用 route-world head。
+- 本地 CALVIN `dataset/Calvin_rlds` 512/512 shard 全量 SHA-256/schema/action/skill 审计已通过：17,870 records、1,071,807 frames、785,887 H=16 windows、unknown=0；`start_mtp_calvin.py` 已完成真实本地路径 dry-run，全链展开 conversion→audit/equivalence→Stage 1/2/3 resume。
 
 ### 尚未完成
 
@@ -47,7 +48,7 @@
 - 原始-backbone新 lineage 的修正版 step 0→2→25→100→1000→最多50000 DDP Stage 1 链路。
 - Stage 1 future predictor 在至少 32 个不同 validation episode 上明确优于 `copy_current`。
 - Stage 3 真实 optimizer/resume、LIBERO 四 suite 正式结果和机制消融。
-- CALVIN ABC 全量转换/训练及 D 环境官方 1,000-sequence 评测。
+- CALVIN 原始-backbone formal feature store、100-window equivalence、8-GPU 三阶段训练及 D 环境官方 1,000-sequence 评测。
 
 ### 下一步
 
@@ -55,6 +56,59 @@
 2. 去掉 `--dry-run` 从 step 0 建立修正版正式 lineage，并确认 validation 记录中 `sampling_contract=episode_balanced_deterministic_v1`、`validation_mode=deployment`、`unique_episodes>=32`。
 3. Stage 1 只在 `checkpoint_best.pt` 的 `mowe_stage1_quality_gate_v2` 通过后进入 Stage 2；默认 50,000-step 合同不得在 step 35,000 前早停。
 4. 资源配额与告警完全由 MTP/云平台承担；一键命令不再接受或需要任何 monitoring 参数。
+
+## 2026-07-19 - CALVIN ABC RLDS 全量数据合同与一键三阶段入口
+
+### Goal
+
+基于本地已下载的 512-shard `calvin_abc` RLDS，补齐与 LIBERO 同等级的 feature-store、审计、Stage 1→2→3、恢复和质量门一键流程。
+
+### Changed
+
+- 新增严格 `CalvinRLDSEpisodeDataset`：验证 512 shard 命名/完整性/SHA-256，解析双相机 PNG、7D action、15D state 和语言，并使用 `(shard, record_index, source_episode_id, timestep)` 消除真实数据中 70 个复用 source id 的碰撞。
+- CALVIN 专用 `calvin_language_motor_verb_v1` 映射覆盖真实 paraphrase（含 `slide/sweep/toggle/take/store/remove/unstack/collapse` 与 `go/in` 前导短语），保持七 route taxonomy 不变；真实全量 unknown ratio 从 30.65% 降为 0。
+- 修正 CALVIN converter 的 formal expected window count：H=16 使用 `length-16`，不再沿用旧 `length-8`；converter/equivalence/readiness 支持 `calvin_abc_rlds` benchmark identity。
+- 新增 `start_mtp_calvin.py`：自动完成 raw audit、缺失 formal store 时可恢复转换、feature checksum/8-rank audit、100-window equivalence，以及与 LIBERO 相同的 Stage 1 `0→2→25→100→1000→50000`、Stage 2/3 smoke/long-run、best/predecessor/early-stop/quality contracts。
+- CALVIN evaluator 不再要求人工把 q01/q99 从报告抄入静态 config；它从 Stage 3 checkpoint 的 `raw_calvin_contract` 恢复精确 action adapter，并在 config 已显式填写时执行一致性校验。
+- CALVIN 三阶段配置统一为 50,000-step H=16 RLDS contract，关闭 resource telemetry；新增 `docs/MTP_CALVIN_ONE_CLICK_TRAINING.md` 和 launcher/reader tests。
+
+### Commands Run
+
+```bash
+/Users/tt/miniconda3/envs/mowe/bin/python scripts/audit_calvin_training_data.py \
+  --dataset-root dataset/Calvin_rlds --dataset-format rlds \
+  --min-segment-length 17 --output outputs/calvin_local_data_audit.json \
+  --skill-config-output outputs/calvin_local_skill_experts.json
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests \
+  -p 'test_calvin_dataset.py' -v
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests \
+  -p 'test_start_mtp*.py' -v
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -v
+/Users/tt/miniconda3/envs/mowe/bin/python start_mtp_calvin.py \
+  --dataset-root dataset/Calvin_rlds --feature-store /tmp/.../store \
+  --openvla-checkpoint /tmp/.../openvla --openvla-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --dino-checkpoint /tmp/.../dino --run-root-dir /tmp/.../runs \
+  --run-id local-contract --dry-run
+/Users/tt/miniconda3/envs/mowe/bin/python -m compileall -q \
+  mowe_wam scripts tests start_mtp.py start_mtp_calvin.py
+git diff --check
+```
+
+### Result
+
+- 真实本地全量 raw audit 通过：512/512 shard checksum、17,870 records、1,071,807 frames、785,887 H=16 windows、六 motor 类齐全、unknown=0；报告为 `outputs/calvin_local_data_audit.json`。
+- CALVIN dataset 5 项、Flow contracts 25 项与 LIBERO/CALVIN launcher 6 项专项测试通过；完整发现 86 项中 85 项通过，唯一错误仍为本机默认 `PYTHONPATH` 缺少既有 OpenVLA-OFT `prismatic` 依赖；真实本地数据路径 dry-run 退出码 0，完整展开 conversion、两类 static audit 和三阶段 init/resume 链。
+- `compileall`、四份 CALVIN JSON config/report 解析、runbook Markdown fence 和 `git diff --check` 通过。
+- 本轮没有 OpenVLA/DINO 本地 snapshot 和 8 GPU，因此未执行 feature encoding、optimizer step 或 simulator；不得把 raw audit/dry-run 称为正式训练或 CALVIN success rate。
+
+### Issues
+
+- 本地下载仅含 ABC train RLDS；官方 D environment、CALVIN simulator repo 和 1,000-sequence evaluator 仍需在评测节点单独准备。
+- formal conversion 会首次顺序读取约 51 GB 并进行原始 OpenVLA/DINO 编码，吞吐和显存必须在目标 GPU 节点实测。
+
+### Next
+
+- 按 `docs/MTP_CALVIN_ONE_CLICK_TRAINING.md` 在 8 GPU 节点先 dry-run，再用同命令启动 formal conversion 与独立三阶段 lineage；通过 100-window equivalence 后才接受训练启动。
 
 ## 2026-07-19 - 写入 MTP v2 重新训练操作
 

@@ -466,7 +466,7 @@ class Launcher:
             config["skill_expert_config"] = str(
                 self.args.skill_config.resolve()
                 if self.args.skill_config is not None
-                else (self.report_root / "skill_experts_h16.json").resolve()
+                else self.default_skill_config_path().resolve()
             )
             config["flow"]["num_inference_steps"] = self.args.flow_solver_steps
             config["training"].update(
@@ -534,6 +534,9 @@ class Launcher:
             destination = config_root / f"{name}.json"
             atomic_json(destination, config)
             self.runtime_configs[name] = str(destination)
+
+    def default_skill_config_path(self) -> Path:
+        return self.report_root / "skill_experts_h16.json"
 
     def ensure_skill_config(self) -> Path:
         if self.args.skill_config is not None:

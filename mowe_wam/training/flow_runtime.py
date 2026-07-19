@@ -254,9 +254,14 @@ def validate_flow_config(cfg: dict[str, Any]) -> None:
 
 
 def validate_skill_config(skill_cfg: dict[str, Any]) -> None:
-    if skill_cfg.get("label_version") != LABEL_VERSION:
+    accepted_label_versions = {
+        LABEL_VERSION,
+        "calvin_language_motor_verb_v1",
+    }
+    if skill_cfg.get("label_version") not in accepted_label_versions:
         raise ValueError(
-            f"Skill label version mismatch: {skill_cfg.get('label_version')!r} != {LABEL_VERSION!r}."
+            "Skill label version mismatch: "
+            f"{skill_cfg.get('label_version')!r} not in {sorted(accepted_label_versions)!r}."
         )
     if skill_cfg.get("skills") != SKILL_TO_ID:
         raise ValueError(f"Skill taxonomy mismatch: {skill_cfg.get('skills')} != {SKILL_TO_ID}.")

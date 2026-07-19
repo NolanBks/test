@@ -5,7 +5,7 @@
   "benchmark_contract": {
     "name": "calvin",
     "setting": "ABC-D",
-    "training_split": "task_ABC_D/training language segments only",
+    "training_split": "calvin_abc RLDS train shards only",
     "evaluation_environment": "D",
     "official_repo_commit": "fa03f01f19c65920e18cf37398a9ce859274af76"
   },
@@ -25,8 +25,8 @@
   "data": {
     "backend": "mowe_feature_store_v1",
     "data_root": null,
-    "feature_store_path": "TBD/calvin_abc_features_v1",
-    "dataset_names": ["calvin_abc_language_segments"],
+    "feature_store_path": "TBD/calvin_abc_rlds_features_v1",
+    "dataset_names": ["calvin_abc_rlds"],
     "skill_sidecar_path": null,
     "image_aug": false,
     "num_workers": 0,
@@ -51,7 +51,7 @@
     "precision": "bf16",
     "batch_size": 1,
     "grad_accumulation_steps": 1,
-    "max_steps": 20000,
+    "max_steps": 50000,
     "learning_rates": {
       "view_fusion": 0.0001,
       "memory_encoder": 0.0001,
@@ -71,15 +71,26 @@
       "timeout_seconds": 1800,
       "broadcast_buffers": false,
       "find_unused_parameters": false,
-      "memory_guard_fraction": 0.80
+      "resource_monitoring": false
     }
   },
   "validation": {
     "enabled": true,
     "eval_freq": 500,
-    "num_batches": 32,
+    "num_batches": null,
     "windows_per_episode": 1,
+    "min_unique_episodes": 32,
+    "modes": ["diagnostic", "deployment"],
     "seed": 2701,
-    "run_at_start": false
+    "run_at_start": false,
+    "early_stopping": {
+      "enabled": true,
+      "metric": "total_loss",
+      "min_delta": 0.0001,
+      "patience": 5,
+      "min_steps": 35000,
+      "validation_mode": "deployment",
+      "require_schedule_completion": true
+    }
   }
 }

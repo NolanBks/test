@@ -37,6 +37,43 @@ def _assert_checkpoint_action_contract(metadata: dict, action_adapter: CalvinAct
         raise ValueError(
             "CALVIN evaluation requires a fine-tuned checkpoint with recorded CALVIN action statistics."
         )
+
+
+def action_adapter_from_checkpoint(
+    metadata: dict, benchmark_cfg: dict
+) -> CalvinActionAdapter:
+    """Resolve the exact ABC-train adapter saved in the Stage-3 lineage."""
+
+    statistics = metadata.get("data_contract", {}).get("joint_action_statistics")
+    if not isinstance(statistics, dict):
+        raise ValueError("CALVIN checkpoint is missing joint action statistics.")
+    raw_contract = statistics.get("raw_calvin_contract")
+    if not isinstance(raw_contract, dict):
+        raise ValueError("CALVIN checkpoint is missing its raw action adapter contract.")
+    checkpoint_adapter = CalvinActionAdapter.from_config(raw_contract)
+    configured = benchmark_cfg.get("action", {})
+    required = (
+        "motion_q01",
+        "motion_q99",
+        "gripper_open_value",
+        "gripper_closed_value",
+    )
+    if all(
+        configured.get(name) is not None and configured.get(name) != "TBD"
+        for name in required
+    ):
+        configured_adapter = CalvinActionAdapter.from_config(configured)
+        if configured_adapter.contract() != checkpoint_adapter.contract():
+            raise ValueError(
+                "Benchmark action config differs from the checkpoint-derived CALVIN contract."
+            )
+    benchmark_cfg["action"] = {
+        **configured,
+        **checkpoint_adapter.contract(),
+        "statistics_source": "CALVIN ABC training split saved in Stage-3 checkpoint",
+    }
+    _assert_checkpoint_action_contract(metadata, checkpoint_adapter)
+    return checkpoint_adapter
     observed_low = [float(value) for value in statistics.get("q01", [])[:6]]
     observed_high = [float(value) for value in statistics.get("q99", [])[:6]]
     if observed_low != list(action_adapter.motion_q01) or observed_high != list(
@@ -74,8 +111,7 @@ def load_custom_model(
         backbone_checkpoint,
         requested_identity=requested_identity,
     )
-    action_adapter = CalvinActionAdapter.from_config(benchmark_cfg["action"])
-    _assert_checkpoint_action_contract(metadata, action_adapter)
+    action_adapter = action_adapter_from_checkpoint(metadata, benchmark_cfg)
     cfg = copy.deepcopy(saved_cfg)
     deep_update(
         cfg,

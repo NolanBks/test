@@ -1,0 +1,29 @@
+cd /home/ma-user/work/algorithm/chaoxintao_2/MoWE/MoWE
+
+python - <<'PY'
+import json
+from pathlib import Path
+
+path = Path(
+    "/home/ma-user/work/algorithm/chaoxintao_2/MoWE/outputs/"
+    "libero_original_openvla_h16_v2/ddp8/stage1/validation_log.jsonl"
+)
+
+for line in path.read_text().splitlines():
+    row = json.loads(line)
+    if (
+        row.get("validation_mode") == "deployment"
+        and row.get("step") in {45000, 47500}
+    ):
+        print("\nstep =", row["step"])
+        print("total_loss =", row["metrics"]["total_loss"])
+        for horizon in ("4", "8", "16"):
+            metric = row["future_horizon_metrics"][horizon]
+            predicted = metric["smooth_l1"]
+            baseline = metric["current_copy_smooth_l1"]
+            improvement = 1.0 - predicted / baseline
+            print(
+                f"H={horizon}: predicted={predicted:.8f}, "
+                f"copy={baseline:.8f}, improvement={improvement:.2%}"
+            )
+PY

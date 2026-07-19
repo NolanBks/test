@@ -530,6 +530,39 @@ class PrefixQueueTests(unittest.TestCase):
 
 
 class CalvinAdapterTests(unittest.TestCase):
+    def test_evaluation_action_adapter_comes_from_checkpoint_contract(self):
+        from mowe_wam.benchmarks.calvin.custom_model import (
+            action_adapter_from_checkpoint,
+        )
+
+        raw = {
+            "motion_q01": [-0.5] * 6,
+            "motion_q99": [0.5] * 6,
+            "motion_mask": [True] * 6,
+            "action_mode": "relative_cartesian",
+            "rotation_representation": "euler_xyz",
+            "gripper_open_value": 1.0,
+            "gripper_closed_value": -1.0,
+            "clip_normalized_motion": True,
+        }
+        metadata = {
+            "data_contract": {
+                "joint_action_statistics": {
+                    "q01": [-0.5] * 6 + [0.0],
+                    "q99": [0.5] * 6 + [1.0],
+                    "raw_calvin_contract": raw,
+                }
+            }
+        }
+        benchmark = {"action": {"motion_q01": "TBD", "motion_q99": "TBD"}}
+        adapter = action_adapter_from_checkpoint(metadata, benchmark)
+        self.assertEqual(adapter.motion_q01, (-0.5,) * 6)
+        self.assertEqual(benchmark["action"]["gripper_open_value"], 1.0)
+        incompatible = copy.deepcopy(benchmark)
+        incompatible["action"]["motion_q01"] = [-0.4] * 6
+        with self.assertRaisesRegex(ValueError, "differs"):
+            action_adapter_from_checkpoint(metadata, incompatible)
+
     def test_calvin_sequence_diagnostics_track_attempted_tasks_and_failure_position(self):
         from scripts.eval_calvin_flow_wam import _summarize_sequence_records
 

@@ -18,6 +18,7 @@ outputs/
 checkpoints/
 wandb/
 experiments/logs/
+dataset/
 
 # Large model/data artifacts
 datasets/
