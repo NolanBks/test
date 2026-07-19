@@ -10,7 +10,7 @@
 
 - 研究主线为 `Nominal Flow Policy + Verb-Seeded Residual Flow Skill Experts + MAW Routing`。
 - 第一版唯一 frozen context backbone 已固定为 immutable revision 的原始 `openvla/openvla-7b`；`external/openvla-oft` 只作为双视角兼容 loader，不使用 LIBERO-finetuned OFT 权重。
-- 当前优先级是在目标 8 卡节点通过无系统资源监控的 `start_mtp.py` 完成正式 Stage 1→2→3；LIBERO 正式训练/评测稳定后再推进 CALVIN。
+- 当前 `v2` 已完成真实 8 卡 Stage 1→2→3；优先级切换为在无 sudo/EGL 的目标节点使用 OSMesa 完成 LIBERO simulator smoke、小样本 gate 和可恢复正式评测，稳定后再推进 CALVIN。
 - 旧 predicate/event 和 regression residual-MoE 代码只作为 baseline 保留。
 
 ### 当前代码事实
@@ -40,22 +40,59 @@
 - 一键入口现永久关闭资源 telemetry：不读取 `/proc`/cgroup、RSS、OOM event 或 GPU memory，不运行 feature-store soak、resource runtime audit 或 resource readiness；数据、等价性、checkpoint、validation、early stopping 和 Stage 1 质量门保持启用。
 - raw/cache equivalence 的 raw matcher 现优先使用 formal store 已记录的精确 `(source_file_key, source_traj_index, step_id)`，只有旧 store 缺少该 provenance 时才回退图像摘要 `episode_id`；这修复跨服务器同计数/同 manifest 下的少量 image-fingerprint missing pair，不会放宽 100/100 gate。
 - 真实 8×GPU Stage 1 step 0→2 首次运行在完成 step 1 后触发 DDP unused-parameter reducer 错误；参数索引已精确映射为 nominal trunk 的可选 `token_condition_projection` 与 Stage-1 无监督的 `world_model.route_world_head`，stage 配置现按真实梯度路径冻结它们，Stage 2/3 会重新启用 route-world head。
-- 修正版 `v2` 已在真实 8 卡节点完成 Stage 1：step 47,500 发生合规 deployment plateau early stop，best checkpoint 为 step 45,000，episode-balanced validation 覆盖 78 个 episode；H=4/8/16 相对 `copy_current` 为 `-3.89%/+37.68%/+57.68%`，平均 `+30.49%`。旧门禁仅因 H=4 的轻微回退阻塞 Stage 2；当前代码已改为平均改善≥10% 且任一尺度回退≤5%，服务器尚未重跑新门禁。
+- 修正版 `v2` 已在真实 8 卡节点完成完整 Stage 1→2→3，launcher `pipeline.status=complete`。Stage 1 latest/best=`47,500/45,000`，Stage 2/3 latest/best=`38,000/35,500`；Stage 1 v3 门禁通过，Stage 3 best 的 H=4/8/16 改善约 `+1.01%/+40.48%/+58.91%`。Stage 3 predicted boundary recall/F1 偏低，仍需 simulator 判断实际影响。
 - 本地 CALVIN `dataset/Calvin_rlds` 512/512 shard 全量 SHA-256/schema/action/skill 审计已通过：17,870 records、1,071,807 frames、785,887 H=16 windows、unknown=0；`start_mtp_calvin.py` 已完成真实本地路径 dry-run，全链展开 conversion→audit/equivalence→Stage 1/2/3 resume。
 
 ### 尚未完成
 
-- 在服务器同步当前门禁代码并对现有 `v2` 重跑 `mowe_stage1_quality_gate_v3`；本地真实数值重放已通过，但不能替代服务器报告。
-- `v2` 的 Stage 2/3 真实 8 卡训练与 predecessor/resume 证据。
-- Stage 3 真实 optimizer/resume、LIBERO 四 suite 正式结果和机制消融。
+- 无 sudo/EGL 节点上的 OSMesa LIBERO one-task/1-trial simulator smoke。
+- 四 suite 每任务 5 trials 小样本 gate、50 trials × 三 seeds 正式 success rate 和 future-shuffle 等机制消融。
 - CALVIN 原始-backbone formal feature store、100-window equivalence、8-GPU 三阶段训练及 D 环境官方 1,000-sequence 评测。
 
 ### 下一步
 
-1. 将当前门禁修正版同步到目标 8 卡节点，保持 `run-id=libero_original_openvla_h16_v2`，重新执行原正式一键命令；不要删除或重训已完成的 Stage 1。
-2. 确认 `reports/stage1_quality_gate.json` 为 `mowe_stage1_quality_gate_v3`、`passed=true`、`validation_step=45000`，随后由 launcher 自动启动 Stage 2。
-3. Stage 2/3 继续保持 predecessor identity、deployment-only schedule-aware early stop 和完整 same-stage resume 合同。
-4. 资源配额与告警完全由 MTP/云平台承担；一键命令不接受或需要任何 monitoring 参数。
+1. 按 `docs/MTP_ONE_CLICK_TRAINING.md` 第 9 节，在全新 MTP 评测任务最开头设置 `MUJOCO_GL=osmesa`、`PYOPENGL_PLATFORM=osmesa`，使用 Stage 3 `checkpoint_best.pt` step 35,500 运行 one-task/1-trial smoke。
+2. smoke 合同通过后运行四 suite 每任务 5 trials；success 全零或 prefix/high-risk 明显异常时停下排查，不直接进入正式评测。
+3. 小样本 gate 通过后按 seeds `7/17/27` 运行四 suite 每任务 50 trials，并用独立 JSONL + `--resume-results` 恢复。
+4. 评测不使用 sudo/EGL，不加入系统或内存监控；资源配额与告警继续由 MTP 平台承担。
+
+## 2026-07-19 - v2 完成审计与 MTP OSMesa 评测指南
+
+### Goal
+
+审计已完成的 `v2` 三阶段输出，并为无 sudo、无 EGL、仅 OSMesa 的 MTP 节点提供可直接执行和恢复的 LIBERO 评测流程。
+
+### Changed
+
+- `docs/MTP_ONE_CLICK_TRAINING.md` 更新 `v2` 状态：Stage 1/2/3 均已完成，最终评测固定使用 Stage 3 `checkpoint_best.pt` step 35,500，不使用 latest。
+- 新增 OSMesa-only 评测章节：固定真实服务器 repo、run、OpenVLA、revision、Python 和输出路径；所有 Python/OpenGL import 前设置 `MUJOCO_GL=osmesa`、`PYOPENGL_PLATFORM=osmesa` 和软件渲染。
+- 新增 checkpoint/metadata/OSMesa import 预检、variable-prefix queue smoke、one-task/1-trial simulator smoke、四 suite 每任务 5 trials gate、四 suite × 50 trials × seeds `7/17/27` 正式评测及结果汇总。
+- 所有 rollout 使用独立 episode JSONL、summary 和日志；默认携带 `--resume-results`，并用 checkpoint/suite/seed/flow-seed 合同拒绝混写。
+- 明确禁止 sudo、EGL、系统包安装和系统资源监控；OSMesa/EGL/import、checkpoint 缺失、identity 不一致和全零 rollout 分别给出停止处理。
+
+### Commands Run
+
+```bash
+python -c '<解析 MTP 文档第 9 节；AST 检查 4 个内嵌 Python；bash -n 检查 8 个 Bash 代码块>'
+/Users/tt/miniconda3/envs/mowe/bin/python scripts/eval_libero_temporal_skill.py --help
+/Users/tt/miniconda3/envs/mowe/bin/python scripts/eval_libero_temporal_skill.py --queue-smoke
+git diff --check
+```
+
+### Result
+
+- 文档 Markdown fence 成对，4 个内嵌 Python 块均通过 AST 解析，8 个 Bash 块均通过 `bash -n`。
+- 第 9 节所有可执行代码块只使用 OSMesa，未包含 EGL、sudo 或 `checkpoint_latest.pt`；评测脚本 CLI 参数与文档一致。
+- 本轮只完成本地静态合同检查，没有在当前机器启动 LIBERO/MuJoCo simulator；不得声称 OSMesa rollout 或 success rate 已通过。
+
+### Issues
+
+- 目标服务器 OSMesa Python import、真实 one-task rollout、四-suite success rate 仍待用户在 MTP 节点执行。
+- 本地同步的 `outputs` 只有 checkpoint metadata，没有 `.pt` 权重；实际评测必须在仍保留 `checkpoint_best.pt` 的服务器上运行。
+
+### Next
+
+- 在目标节点从 MTP 文档 9.1 开始执行；one-task smoke 合同通过后才进入 5-trial gate，5-trial success 非全零且 prefix/reason 分布合理后才进入 50-trial × 三 seeds 正式评测。
 
 ## 2026-07-19 - 按真实 Stage 1 多尺度结果修正晋级门禁
 
