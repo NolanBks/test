@@ -1,6 +1,6 @@
 # MoWE-WAM 项目计划
 
-更新时间：2026-07-17（原始 OpenVLA backbone + LIBERO/CALVIN 双基准主线修订）
+更新时间：2026-07-20（CALVIN Stage 1 多尺度 loss 与 mechanism checkpoint v2 修订）
 
 本文档是项目研究方向、论文故事和实验边界的最高优先级来源。具体代码接口与任务顺序由 `IMPLEMENTATION_PLAN.md` 规定；架构风险和验收门槛由 `ARCHITECTURE_RISKS.md` 规定；实际完成状态只记录在 `DEV_LOG.md`。
 
@@ -297,6 +297,8 @@ A_final[j] = concat(motion_final[j], gripper_final[j])
 
 nominal motion 使用 conditional flow matching，gripper 使用逐位置 BCE。训练早期用真实 future action chunk 条件化 WAM，随后逐渐切换到 nominal sample；使用 nominal action 时，以 6D motion distance 为主的 gate 降低错误因果配对的 world loss。WAM 同时输出 `h_1...h_16`，并由 `h_1/h_4/h_8/h_16` 预测高维 future/delta targets。expert warm-start 开始前冻结 nominal motion-flow 与 gripper heads，并以固定 solver/noise schedule 生成可复现 `A0`。
 
+CALVIN 的高帧率 static-camera 数据使 H=1 visual delta 接近零，不能让其不稳定方向与 H=4/8/16 等权主导 world gradient。CALVIN v2 保留 H=1 与逐步 `h_1`，但高维 horizon loss 权重固定为 `0.25/1/1/1`；delta Smooth-L1 使用带下限的 batch/horizon RMS normalization，delta cosine 按 target-delta magnitude 连续降权。该规则只改变训练目标，不向部署输入加入 teacher target。
+
 ### Stage 2：Label-Seeded Residual Flow Expert Warm-start
 
 加载 Stage 1 checkpoint；保持 nominal flow head 冻结，加入：
@@ -365,6 +367,8 @@ lambda_balance  = 0.01
 lambda_residual = 0.001
 lambda_endpoint = 0.0（warm-start）；0.05（joint 起点）
 ```
+
+上述是通用/LIBERO 默认。CALVIN v2 仍保留 `lambda_delta=0.5`，但内部先应用 `H=[1,4,8,16]` 的 `0.25/1/1/1` 权重、per-horizon RMS normalization 与 magnitude-aware cosine；避免通过简单降低整体 delta 权重掩盖短时近零 target 的数值问题。CALVIN Stage 1 同时保留 total-loss best 与 mechanism best，后者按 H=4/8/16 absolute future 相对 copy-current 的门禁语义选择并作为 Stage 2 predecessor。
 
 不得继续将 predicate/progress/risk/event 或 simulator-state label loss 放入主方法默认总损失。Flow losses 和 endpoint L1 只覆盖 6D motion；gripper 只由 binary BCE 监督。`expert_skill_labels` 是训练期逐 timestep verb/skill supervision，不是部署输入。`null_finish` 没有可学习 residual loss，代码必须断言其 motion residual/velocity 为精确零；它不将 nominal action 置零，也不触发 termination。
 

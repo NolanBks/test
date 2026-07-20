@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from mowe_wam.utils.optional import require_torch
 from mowe_wam.training.flow_matching import (
     conditional_flow_matching_loss,
@@ -11,14 +13,48 @@ from mowe_wam.training.flow_matching import (
 )
 
 
-def _masked_horizon_mean(values, mask, sample_weight=None):
+def _masked_horizon_mean(
+    values,
+    mask,
+    sample_weight=None,
+    horizon_weight=None,
+):
     weights = mask.to(device=values.device, dtype=values.dtype)
     if sample_weight is not None:
         weights = weights * sample_weight.to(device=values.device, dtype=values.dtype).unsqueeze(1)
-    return (values * weights).sum() / weights.sum().clamp_min(1.0)
+    if horizon_weight is not None:
+        weights = weights * horizon_weight.to(
+            device=values.device, dtype=values.dtype
+        ).reshape(1, -1)
+    return (values * weights).sum() / weights.sum().clamp_min(1e-6)
 
 
-def latent_prediction_loss(prediction, target, horizon_mask, sample_weight=None):
+def _configured_horizon_weights(reference, horizon_mask, config):
+    """Return immutable loss weights aligned with the configured horizon order."""
+
+    torch = require_torch()
+    raw = dict(config or {}).get("horizon_weights")
+    horizon_count = int(horizon_mask.shape[1])
+    if raw is None:
+        return torch.ones(horizon_count, device=reference.device, dtype=reference.dtype)
+    if not isinstance(raw, (list, tuple)) or len(raw) != horizon_count:
+        raise ValueError(
+            "world_prediction_loss.horizon_weights must contain one positive "
+            "value per configured future horizon."
+        )
+    weights = torch.as_tensor(raw, device=reference.device, dtype=reference.dtype)
+    if not bool(torch.isfinite(weights).all()) or bool(weights.le(0).any()):
+        raise ValueError("world_prediction_loss.horizon_weights must be finite and positive.")
+    return weights
+
+
+def latent_prediction_loss(
+    prediction,
+    target,
+    horizon_mask,
+    sample_weight=None,
+    horizon_weight=None,
+):
     """Cosine plus Smooth-L1 distance, averaged over valid horizons."""
 
     torch = require_torch()
@@ -26,19 +62,141 @@ def latent_prediction_loss(prediction, target, horizon_mask, sample_weight=None)
     truth = target.to(device=pred.device, dtype=pred.dtype)
     smooth_l1 = torch.nn.functional.smooth_l1_loss(pred, truth, reduction="none").mean(dim=(-1, -2))
     cosine = 1.0 - torch.nn.functional.cosine_similarity(pred, truth, dim=-1).mean(dim=-1)
-    return _masked_horizon_mean(cosine + 0.5 * smooth_l1, horizon_mask, sample_weight=sample_weight)
+    return _masked_horizon_mean(
+        cosine + 0.5 * smooth_l1,
+        horizon_mask,
+        sample_weight=sample_weight,
+        horizon_weight=horizon_weight,
+    )
 
 
-def latent_prediction_components(prediction, target, horizon_mask, sample_weight=None):
+def latent_prediction_components(
+    prediction,
+    target,
+    horizon_mask,
+    sample_weight=None,
+    horizon_weight=None,
+):
     torch = require_torch()
     pred = prediction.float()
     truth = target.to(device=pred.device, dtype=pred.dtype)
     smooth_l1 = torch.nn.functional.smooth_l1_loss(pred, truth, reduction="none").mean(dim=(-1, -2))
     cosine = 1.0 - torch.nn.functional.cosine_similarity(pred, truth, dim=-1).mean(dim=-1)
     return (
-        _masked_horizon_mean(cosine, horizon_mask, sample_weight),
-        _masked_horizon_mean(smooth_l1, horizon_mask, sample_weight),
+        _masked_horizon_mean(
+            cosine, horizon_mask, sample_weight, horizon_weight
+        ),
+        _masked_horizon_mean(
+            smooth_l1, horizon_mask, sample_weight, horizon_weight
+        ),
     )
+
+
+def delta_prediction_components(
+    prediction,
+    target,
+    horizon_mask,
+    *,
+    sample_weight=None,
+    horizon_weight=None,
+    config=None,
+):
+    """Magnitude-aware delta objective with bounded per-horizon RMS scaling.
+
+    Delta directions are ill-defined when the frozen visual target barely
+    changes.  Weighting token cosine by target magnitude prevents those nearly
+    static tokens from dominating, while the Smooth-L1 branch remains active.
+    Optional batch/horizon RMS normalization equalizes the raw scale of short
+    and long horizons without changing the model's raw-delta output contract.
+    """
+
+    torch = require_torch()
+    cfg = dict(config or {})
+    pred = prediction.float()
+    truth = target.to(device=pred.device, dtype=pred.dtype)
+
+    raw_smooth = torch.nn.functional.smooth_l1_loss(
+        pred, truth, reduction="none"
+    ).mean(dim=(-1, -2))
+    rms_cfg = dict(cfg.get("delta_rms_normalization") or {})
+    rms_mode = str(rms_cfg.get("mode", "none"))
+    per_sample_target_power = truth.square().mean(dim=(2, 3))
+    valid_horizon = horizon_mask.to(
+        device=truth.device, dtype=per_sample_target_power.dtype
+    )
+    target_rms = (
+        (per_sample_target_power * valid_horizon).sum(dim=0)
+        / valid_horizon.sum(dim=0).clamp_min(1.0)
+    ).sqrt().detach()
+    if rms_mode == "none":
+        normalized_pred = pred
+        normalized_truth = truth
+    elif rms_mode == "batch_horizon":
+        floor = float(rms_cfg.get("floor", 0.05))
+        if not math.isfinite(floor) or floor <= 0:
+            raise ValueError(
+                "world_prediction_loss.delta_rms_normalization.floor must be positive."
+            )
+        denominator = target_rms.clamp_min(floor).reshape(1, -1, 1, 1)
+        normalized_pred = pred / denominator
+        normalized_truth = truth / denominator
+    else:
+        raise ValueError(
+            "world_prediction_loss.delta_rms_normalization.mode must be "
+            "'none' or 'batch_horizon'."
+        )
+    normalized_smooth = torch.nn.functional.smooth_l1_loss(
+        normalized_pred, normalized_truth, reduction="none"
+    ).mean(dim=(-1, -2))
+
+    token_cosine = 1.0 - torch.nn.functional.cosine_similarity(
+        pred, truth, dim=-1
+    )
+    cosine_cfg = dict(cfg.get("delta_cosine") or {})
+    cosine_mode = str(cosine_cfg.get("mode", "uniform"))
+    if cosine_mode == "uniform":
+        token_weight = torch.ones_like(token_cosine)
+    elif cosine_mode == "magnitude_aware":
+        scale = float(cosine_cfg.get("scale", 0.10))
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError(
+                "world_prediction_loss.delta_cosine.scale must be positive."
+            )
+        token_rms = truth.square().mean(dim=-1).sqrt().detach()
+        token_weight = token_rms / (token_rms + scale)
+    else:
+        raise ValueError(
+            "world_prediction_loss.delta_cosine.mode must be 'uniform' or "
+            "'magnitude_aware'."
+        )
+    cosine = (token_cosine * token_weight).sum(dim=-1) / token_weight.sum(
+        dim=-1
+    ).clamp_min(1e-6)
+
+    cosine_loss = _masked_horizon_mean(
+        cosine, horizon_mask, sample_weight, horizon_weight
+    )
+    smooth_loss = _masked_horizon_mean(
+        normalized_smooth, horizon_mask, sample_weight, horizon_weight
+    )
+    diagnostics = {
+        "delta_raw_smooth_l1_loss": _masked_horizon_mean(
+            raw_smooth, horizon_mask, sample_weight, horizon_weight
+        ),
+        "delta_cosine_weight_mean": _masked_horizon_mean(
+            token_weight.mean(dim=-1),
+            horizon_mask,
+            sample_weight,
+            horizon_weight,
+        ),
+        "delta_target_rms_mean": _masked_horizon_mean(
+            target_rms.reshape(1, -1).expand_as(horizon_mask),
+            horizon_mask,
+            sample_weight,
+            horizon_weight,
+        ),
+    }
+    return cosine_loss, smooth_loss, diagnostics
 
 
 def router_load_balance_loss(router_probs):
@@ -121,6 +279,7 @@ def flow_wam_skill_losses(
     *,
     stage: str = "joint",
     class_weights=None,
+    world_prediction_config: dict | None = None,
 ):
     """Loss contract for nominal pretrain, oracle warm-start, and joint routing."""
 
@@ -154,19 +313,29 @@ def flow_wam_skill_losses(
     if "future_latent_targets" in outputs and future_mask is not None:
         future_mask = future_mask.to(outputs["future_latents"].device)
         world_gate = outputs.get("action_distance_gate")
+        horizon_weight = _configured_horizon_weights(
+            outputs["future_latents"], future_mask, world_prediction_config
+        )
         losses["world_cosine_loss"], losses["world_smooth_l1_loss"] = latent_prediction_components(
             outputs["future_latents"],
             outputs["future_latent_targets"],
             future_mask,
             sample_weight=world_gate,
+            horizon_weight=horizon_weight,
         )
         losses["world_loss"] = losses["world_cosine_loss"] + 0.5 * losses["world_smooth_l1_loss"]
-        losses["delta_loss"] = latent_prediction_loss(
+        delta_cosine, delta_smooth, delta_diagnostics = delta_prediction_components(
             outputs["delta_latents"],
             outputs["delta_latent_targets"],
             future_mask,
             sample_weight=world_gate,
+            horizon_weight=horizon_weight,
+            config=world_prediction_config,
         )
+        losses["delta_cosine_loss"] = delta_cosine
+        losses["delta_smooth_l1_loss"] = delta_smooth
+        losses["delta_loss"] = delta_cosine + 0.5 * delta_smooth
+        losses.update(delta_diagnostics)
         teacher_mask = outputs.get("teacher_forcing_mask")
         if teacher_mask is not None:
             gt_samples = teacher_mask.reshape(teacher_mask.shape[0], -1).all(dim=1)
@@ -177,6 +346,7 @@ def flow_wam_skill_losses(
                     outputs["future_latent_targets"],
                     future_mask,
                     sample_weight=gt_samples,
+                    horizon_weight=horizon_weight,
                 )
                 losses["world_loss_gt_conditioned"] = gt_cosine + 0.5 * gt_smooth
             if bool(nominal_samples.any()):
@@ -186,6 +356,7 @@ def flow_wam_skill_losses(
                     outputs["future_latent_targets"],
                     future_mask,
                     sample_weight=nominal_weight,
+                    horizon_weight=horizon_weight,
                 )
                 losses["world_loss_nominal_conditioned"] = nominal_cosine + 0.5 * nominal_smooth
 

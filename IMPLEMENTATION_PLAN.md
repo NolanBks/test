@@ -1,6 +1,6 @@
 # MoWE-WAM 当前实现与执行计划
 
-更新时间：2026-07-19（活动文档；完整历史规格已归档）
+更新时间：2026-07-20（活动文档；完整历史规格已归档）
 
 本文档是后续 Codex/agent 编程时默认读取的实现入口，只保留当前事实、关键合同、未完成门槛和下一步顺序。文档瘦身前的完整规格保存在 [`docs/history/IMPLEMENTATION_PLAN_FULL_2026-07-17.md`](docs/history/IMPLEMENTATION_PLAN_FULL_2026-07-17.md)，仅在追溯具体设计、旧任务或历史命令时按章节读取，禁止在新会话启动时默认全文加载。
 
@@ -64,7 +64,7 @@ LIBERO/CALVIN episodic windows or mowe_feature_store_v1
 - 单机 DDP、episode-aware sharding/sampler、rank-0 I/O；通用 runtime 仍保留可选资源诊断，但 `start_mtp.py` 明确关闭且不调用任何系统/内存监控。
 - `mowe_feature_store_v1`、canonical archive、可恢复 converter、结构/equivalence/soak/readiness 审计。
 - feature-store validation 使用确定性的 episode-balanced sparse sampler；正式 launcher 同时记录 diagnostic 与 deployment 两种验证，早停只使用 deployment loss，并等待动作/路由课程调度完成。
-- `checkpoint_best.pt`、Stage 1 `copy_current` 质量门和 Stage 2/3 predecessor identity 校验已实现；`checkpoint_latest.pt` 仍只用于精确 same-stage resume。
+- `checkpoint_best.pt`、Stage 1 `copy_current` 质量门和 Stage 2/3 predecessor identity 校验已实现；CALVIN v2 另保存与该门禁对齐的 `checkpoint_best_mechanism.pt`，`checkpoint_latest.pt` 仍只用于精确 same-stage resume。
 - 可恢复 LIBERO full-suite evaluator。
 - CALVIN action/policy bridge、官方 NPZ 与 512-shard ABC RLDS reader/converter、feature-store configs、`start_mtp_calvin.py` 和官方 evaluator bridge。
 
@@ -74,6 +74,7 @@ LIBERO/CALVIN episodic windows or mowe_feature_store_v1
 - 云端 RTX 4090 已记录旧 LIBERO-OFT backbone 下的真实 Stage 1 step 0→100、resume，以及 Stage 2 oracle one-step/25-step coverage gate；这些结果只证明历史代码路径，不满足新的原始-backbone训练合同，也不能作为新 lineage 的 resume 起点。
 - 已完成的一轮 8 卡 launcher 输出暴露出旧验证/早停合同问题：validation prefix 仅覆盖 1 个 episode，Stage 1/2/3 分别约在 11k/7.5k/5k 早停，Stage 3 尚未进入 predicted-route、各阶段尚未完成 nominal-action 课程；这些结果不能作为机制或正式模型质量证据。
 - 新 `v2` lineage 已在真实 8 卡节点完成完整 Stage 1→2→3。Stage 1 latest/best 为 `47,500/45,000`，Stage 2 与 Stage 3 latest/best 均为 `38,000/35,500`；三阶段均在调度完成后的 78-episode deployment validation 上合规早停，launcher `pipeline.status=complete`。Stage 1 `mowe_stage1_quality_gate_v3` 已通过；Stage 3 best 的 H=4/8/16 相对 `copy_current` 改善约为 `+1.01%/+40.48%/+58.91%`。Stage 3 predicted router 的 boundary recall/F1 仍偏低，必须由 simulator 小样本门槛判断实际影响。
+- 用户提供的 CALVIN v1 服务器截图显示 step 43,500 的 absolute future H=4/8/16 改善约为 `-40.23%/+4.38%/+29.94%`，平均 `-1.97%`，而 delta 重建对应改善约为 `+1.57%/+14.99%/+24.56%`，平均 `+13.71%`；这只属于截图级诊断，不是已同步日志/checkpoint 的完整审计证据。由此建立的 CALVIN v2 新训练合同尚未执行真实 GPU optimizer step。
 - 修正版一键入口的真实 8-GPU NCCL 三阶段训练已完成；LIBERO simulator smoke、四-suite success rate、future-shuffle 机制验证、CALVIN 正式训练与官方评测仍未完成。离线训练指标不能替代这些证据。
 - 代码存在、CLI 可运行、mock/contract 测试通过，均不能替代上述真实证据。
 
@@ -90,7 +91,7 @@ LIBERO/CALVIN episodic windows or mowe_feature_store_v1
 7. **Stage 1 连续训练**：从 step 100 连续训练到 1000，再继续到最多 50,000；早停不得早于 nominal-action 课程完成。
 8. **机制门槛（已完成）**：选择 eligible deployment loss 最优的 `checkpoint_best.pt`，并在至少 32 个不同 validation episode 上要求 H=4/8/16 相对 `copy_current` 的平均改善至少 10%、任一 horizon 的相对回退不超过 5%；通过后才启动 Stage 2/3。`v2` 已通过并完成 Stage 2/3，最终选择 Stage 3 best step 35,500。
 9. **正式评测（当前步骤）**：目标服务器无 sudo/EGL，仅使用 OSMesa。先完成 LIBERO one-task/1-trial smoke，再完成四 suite 每任务 5 trials gate；无 crash/NaN、success 非全零且执行前缀合理后，才运行四 suite × 每任务 50 trials × seeds `7/17/27` 的可恢复正式评测与机制分析。准确命令以 `docs/MTP_ONE_CLICK_TRAINING.md` 第 9 节为准。
-10. **CALVIN 第二基准**：仅在 LIBERO 主线稳定后，以同一原始 backbone identity 重新生成 CALVIN 独立 store，完成 ABC 独立三阶段训练和 D 环境官方 1,000-sequence LH-MTLC 评测。
+10. **CALVIN 第二基准**：仅在 LIBERO 主线稳定后，以同一原始 backbone identity 和 CALVIN 独立 store 启动 v2 新 lineage。Stage 1 固定 `max_steps=100000`、H=1/4/8/16 loss 权重 `0.25/1/1/1`、batch/horizon delta RMS normalization、magnitude-aware delta cosine、70k 后 patience=10，并从 mechanism-best checkpoint 进入 Stage 2；完成 ABC 独立三阶段训练后再做 D 环境官方 1,000-sequence LH-MTLC 评测。v1 的 50k checkpoint 不得续接。
 
 任何步骤失败时停在该层解决；不要通过放宽数据完整性、checkpoint、训练质量或泄漏门槛绕过。系统资源监控由平台侧负责，不进入一键脚本。
 
@@ -131,8 +132,9 @@ LIBERO/CALVIN episodic windows or mowe_feature_store_v1
 - Stage 2 只从 Stage 1 predecessor 初始化；Stage 3 只从 Stage 2 predecessor 初始化。same-stage 使用 `--resume`，跨 stage 使用 `--init-wam`。
 - same-stage resume 必须保持 seed、stage、precision、完整 `max_steps`、optimizer/LR/schedule/loss/window/route contract 不变；只允许调整 `stop_step`、`save_freq`、`log_freq`。
 - 正式 feature-store validation 每个 validation episode 确定性抽取一个窗口，同时输出 diagnostic（GT action；Stage 2/3 oracle route）和 deployment（nominal action + predicted route）记录；早停只读取 deployment `total_loss`，且至少覆盖 32 个不同 episode。
-- 默认 50,000-step 合同下，early-stopping patience 只能从 action conditioning 与（Stage 3）predicted-route schedule 完成后的 step 35,000 开始累计；此前验证只用于诊断，不得消耗 patience。
-- 每个阶段把 eligible deployment loss 最优状态保存为 `checkpoint_best.pt`；跨阶段初始化使用 best checkpoint，并把其 path-independent semantic identity 写入下一阶段 checkpoint。若 predecessor 改变，旧 Stage 2/3 checkpoint 必须 fail closed，不能拼接 lineage。
+- LIBERO 与 CALVIN Stage 2/3 的默认 50,000-step 合同下，early-stopping patience 只能从 action conditioning 与（Stage 3）predicted-route schedule 完成后的 step 35,000 开始累计；CALVIN v2 Stage 1 的 100,000-step 合同最早从 step 70,000 开始累计，此前验证只用于诊断，不得消耗 patience。
+- 每个阶段把 eligible deployment loss 最优状态保存为 `checkpoint_best.pt`；启用 `validation.mechanism_checkpoint` 的 CALVIN Stage 1 还必须保存 future-quality 最优的 `checkpoint_best_mechanism.pt`，质量门和 Stage 2 predecessor 统一使用后者。跨阶段 checkpoint 必须写入 predecessor 的 path-independent semantic identity；若 predecessor 改变，旧 Stage 2/3 必须 fail closed。
+- `world_prediction_loss` 的 horizon weights、delta RMS/cosine 规则属于 same-stage resume 与 checkpoint semantic contract；修改后必须从 step 0 建立新 lineage，但冻结 backbone/DINO/data identity 不变时可复用已通过 formal audit/equivalence 的 feature store。
 - 正式 DDP 合同为 world size 8、BF16、per-device batch 1、accumulation 1、effective global batch 8、NCCL、`num_workers=0`、`pin_memory=false`。
 - `start_mtp.py` 生成的三阶段配置固定 `resource_monitoring=false`，不读取 `/proc`/cgroup、RSS、OOM event 或 GPU memory telemetry，也不运行 soak/runtime/readiness 资源审计；数据审计、等价性、checkpoint 和质量门继续 fail closed。
 

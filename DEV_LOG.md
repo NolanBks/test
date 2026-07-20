@@ -1,6 +1,6 @@
 # MoWE-WAM 当前状态与近期开发日志
 
-更新时间：2026-07-19
+更新时间：2026-07-20
 
 本文件是新会话默认读取的活动日志，只保留当前快照和最近变更索引。2026-07-08 至文档瘦身前的完整逐条记录保存在 [`docs/history/DEV_LOG_2026-07-08_to_2026-07-17.md`](docs/history/DEV_LOG_2026-07-08_to_2026-07-17.md)。需要核对旧命令、输出或失败原因时，先用 `rg` 定位，再读取命中章节；禁止在启动时全文加载历史归档。
 
@@ -42,6 +42,7 @@
 - 真实 8×GPU Stage 1 step 0→2 首次运行在完成 step 1 后触发 DDP unused-parameter reducer 错误；参数索引已精确映射为 nominal trunk 的可选 `token_condition_projection` 与 Stage-1 无监督的 `world_model.route_world_head`，stage 配置现按真实梯度路径冻结它们，Stage 2/3 会重新启用 route-world head。
 - 修正版 `v2` 已在真实 8 卡节点完成完整 Stage 1→2→3，launcher `pipeline.status=complete`。Stage 1 latest/best=`47,500/45,000`，Stage 2/3 latest/best=`38,000/35,500`；Stage 1 v3 门禁通过，Stage 3 best 的 H=4/8/16 改善约 `+1.01%/+40.48%/+58.91%`。Stage 3 predicted boundary recall/F1 偏低，仍需 simulator 判断实际影响。
 - 本地 CALVIN `dataset/Calvin_rlds` 512/512 shard 全量 SHA-256/schema/action/skill 审计已通过：17,870 records、1,071,807 frames、785,887 H=16 windows、unknown=0；`start_mtp_calvin.py` 已完成真实本地路径 dry-run，全链展开 conversion→audit/equivalence→Stage 1/2/3 resume。
+- 用户提供的 CALVIN v1 step 43,500 截图显示 absolute future H=4/8/16 平均改善约 `-1.97%`，其中 H=4 退化约 `40.23%`；delta 重建三尺度平均改善约 `+13.71%`。CALVIN v2 已在代码中改为 H=1/4/8/16 权重 `0.25/1/1/1`、batch/horizon delta RMS normalization、magnitude-aware delta cosine、Stage 1 100k/70k 后 patience=10，并新增 mechanism-best checkpoint；这些修改尚未在真实 GPU 上训练。
 
 ### 尚未完成
 
@@ -54,7 +55,49 @@
 1. 按 `docs/MTP_ONE_CLICK_TRAINING.md` 第 9 节，在全新 MTP 评测任务最开头设置 `MUJOCO_GL=osmesa`、`PYOPENGL_PLATFORM=osmesa`，使用 Stage 3 `checkpoint_best.pt` step 35,500 运行 one-task/1-trial smoke。
 2. smoke 合同通过后运行四 suite 每任务 5 trials；success 全零或 prefix/high-risk 明显异常时停下排查，不直接进入正式评测。
 3. 小样本 gate 通过后按 seeds `7/17/27` 运行四 suite 每任务 50 trials，并用独立 JSONL + `--resume-results` 恢复。
-4. 评测不使用 sudo/EGL，不加入系统或内存监控；资源配额与告警继续由 MTP 平台承担。
+4. CALVIN 使用新的 `calvin_abc_original_openvla_h16_v2` run-id 从 Stage 1 step 0 启动；可复用身份未变且已通过 formal audit/equivalence 的 feature store，但不得恢复 v1 的 50k checkpoint。
+5. 评测不使用 sudo/EGL，不加入系统或内存监控；资源配额与告警继续由 MTP 平台承担。
+
+## 2026-07-20 - CALVIN Stage 1 多尺度 loss 与 mechanism checkpoint v2
+
+### Goal
+
+针对用户提供的 CALVIN v1 step 43,500 失败结果，修复近零 H=1 delta cosine 主导、四 horizon 等权和 total-loss best 与 future-quality gate 错位问题，并建立不可误续接的 100k 新 lineage。
+
+### Changed
+
+- `flow_wam_skill_losses` 新增配置驱动的 horizon weights、带 floor 的 batch/horizon delta RMS normalization 与 magnitude-aware token cosine；额外记录 delta cosine、normalized/raw Smooth-L1、magnitude weight 和 target RMS。
+- CALVIN Stage 1/2/3 配置固定使用 H=1/4/8/16=`0.25/1/1/1`、RMS floor `0.05` 和 cosine scale `0.10`；Stage 1 改为 100,000 steps、70,000 后早停、patience 10，Stage 2/3 仍为 50,000 steps。
+- Stage 1 新增 `checkpoint_best_mechanism.pt` 与 `mechanism_checkpoint.json`；按 H=4/8/16 absolute future/copy-current improvement 选择，仍保留 absolute 质量门，表现较好的 delta 不会被冒充为门禁通过。Stage 2 predecessor 与质量门统一使用 mechanism checkpoint。
+- `world_prediction_loss` 纳入 same-stage resume/semantic identity；旧 v1 checkpoint 会因 max_steps/loss contract 变化被拒绝。CALVIN equivalence reuse identity新增 stage1 runtime config SHA-256。
+- `start_mtp_calvin.py` 和 runbook 默认 run-id 指南升级到 v2；formal feature store 在 backbone/DINO/data identity 不变时允许复用，不重新编码。
+
+### Commands Run
+
+```bash
+python -m json.tool configs/mowe_wam/ddp8_calvin_nominal_flow_feature_store.yaml
+python -m json.tool configs/mowe_wam/ddp8_calvin_warmstart_skill_flow_feature_store.yaml
+python -m json.tool configs/mowe_wam/ddp8_calvin_joint_flow_feature_store.yaml
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -p 'test_flow_torch_contracts.py' -v
+/Users/tt/miniconda3/envs/mowe/bin/python -m unittest discover -s tests -p 'test_start_mtp*.py' -v
+```
+
+### Result
+
+- Flow torch 21/21、LIBERO/CALVIN launcher 8/8 专项测试通过；三份 CALVIN JSON 配置解析通过。
+- 新增回归覆盖近零 delta 不再产生 cosine 主导、world loss 配置属于 resume contract、mechanism selector 不被更低 total loss 误导、launcher 缺失 mechanism checkpoint 时 fail closed，以及 CALVIN dry-run 展开至 Stage 1 100,000。
+- 完整 90 项本地测试中 89 项通过；唯一失败为已知本机 OpenVLA identity 测试缺少 `prismatic` 依赖，与本次 CALVIN loss/launcher 修改无关。`compileall`、Markdown fence、JSON 配置与 `git diff --check` 通过。
+- 使用本地真实 `dataset/Calvin_rlds` 512 shard 完成 v2 dry-run，成功展开 conversion、audit/equivalence、Stage 1 `0→2→25→100→1000→100000` 以及 Stage 2/3 恢复链。
+- 本轮没有运行真实 OpenVLA/DINO encoding、8-GPU optimizer 或 CALVIN simulator；用户截图数字尚未由完整 validation JSONL/checkpoint 重放。
+
+### Issues
+
+- batch/horizon RMS floor `0.05` 与 magnitude cosine scale `0.10` 是 v2 首个受控起点，需要在 0→2→25→100→1000 阶梯中核对各 horizon gradient/loss 范围，不能直接假定长训练一定提升。
+- 本机若需完成 90/90，需在 OpenVLA 身份测试环境补齐 `prismatic`；这不阻塞 CALVIN v2 专项合同验证。
+
+### Next
+
+- 在 8 GPU 节点以 v2 新 run-id 从 step 0 运行，1000-step 观测点重点检查 H=1/H=4、delta cosine weight、target RMS 和 absolute/delta improvement；mechanism checkpoint 按合同从 70k 后才参与 Stage 2 晋级选择。
 
 ## 2026-07-19 - v2 完成审计与 MTP OSMesa 评测指南
 

@@ -1,6 +1,6 @@
 # CALVIN ABC RLDS 一键转换与三阶段训练
 
-更新时间：2026-07-19
+更新时间：2026-07-20
 
 本手册对应仓库内已下载的数据：
 
@@ -15,7 +15,7 @@
 
 ## 1. 已核对的本地数据合同
 
-本地全量只读审计已经实际通过，报告位于 `outputs/calvin_local_data_audit.json`：
+本地全量只读审计已经实际通过，当时报告写入 `outputs/calvin_local_data_audit.json`；该报告是非版本化本地产物，当前缺失时正式启动器会在 run 目录重建：
 
 - 512/512 个 `calvin_abc` train shard，全部 SHA-256 与下载 metadata 一致；
 - 17,870 个独立语言记录，1,071,807 帧；
@@ -55,7 +55,7 @@ cd "$MOWE_ROOT"
   --openvla-revision "$OPENVLA_REVISION" \
   --dino-checkpoint "$DINO_ROOT" \
   --run-root-dir "$MOWE_RUNS" \
-  --run-id calvin_abc_original_openvla_h16_v1 \
+  --run-id calvin_abc_original_openvla_h16_v2 \
   --python "$MOWE_PYTHON" \
   --dry-run
 ```
@@ -63,7 +63,7 @@ cd "$MOWE_ROOT"
 dry-run 不读 51 GB payload、不加载模型、不要求真正执行 CUDA，只检查 512 shard、路径和不可变训练合同，并写出：
 
 ```text
-$MOWE_RUNS/calvin_abc_original_openvla_h16_v1/
+$MOWE_RUNS/calvin_abc_original_openvla_h16_v2/
   launcher_state.json
   configs/stage1.json
   configs/stage2.json
@@ -82,7 +82,7 @@ ddp_stage1_0_2
 ddp_stage1_2_25
 ddp_stage1_25_100
 ddp_stage1_100_1000
-ddp_stage1_1000_50000
+ddp_stage1_1000_100000
 ddp_stage2_0_100
 ddp_stage2_100_50000
 ddp_stage3_0_100
@@ -104,7 +104,7 @@ cd "$MOWE_ROOT"
   --openvla-revision "$OPENVLA_REVISION" \
   --dino-checkpoint "$DINO_ROOT" \
   --run-root-dir "$MOWE_RUNS" \
-  --run-id calvin_abc_original_openvla_h16_v1 \
+  --run-id calvin_abc_original_openvla_h16_v2 \
   --python "$MOWE_PYTHON"
 ```
 
@@ -115,16 +115,18 @@ cd "$MOWE_ROOT"
 3. 若 `$CALVIN_STORE/manifest.json` 不存在或未达到 formal contract，则用单卡 BF16 自动生成 H=16 feature store；converter 按 episode 可恢复；
 4. 验证全部 feature shard checksum、expected/actual episode/frame/window counts 和 8-rank assignment；
 5. 用 100 个真实窗口重新编码 raw RLDS，完成 feature/output/loss 等价性门禁；
-6. Stage 1 按 `0→2→25→100→1000→最多 50000` 运行，same-stage 只改 `stop_step`；
-7. 选择 eligible deployment loss 最优的 `checkpoint_best.pt`，通过跨 episode 的 Stage 1 future/copy-current 质量门后才启动 Stage 2；
+6. Stage 1 按 `0→2→25→100→1000→最多 100000` 运行，same-stage 只改 `stop_step`；H=1/4/8/16 world loss 权重为 `0.25/1/1/1`，delta 使用按 batch/horizon 的 RMS 归一化与 magnitude-aware cosine；
+7. Stage 1 同时保存 deployment total-loss 最优的 `checkpoint_best.pt` 与 future-quality 最优的 `checkpoint_best_mechanism.pt`；质量门和 Stage 2 predecessor 固定使用后者，不允许两种选择标准错位；
 8. Stage 2 先到 100-step smoke，再到最多 50,000；Stage 3 同样执行，并严格绑定 predecessor semantic identity；
-9. 三阶段早停只使用 episode-balanced deployment `total_loss`，且必须等待 action conditioning；Stage 3 还必须等待 predicted-route schedule 完成。
+9. 三阶段早停只使用 episode-balanced deployment `total_loss`，且必须等待 action conditioning；CALVIN v2 Stage 1 最早从 step 70,000 开始累计、patience 为 10，Stage 3 还必须等待 predicted-route schedule 完成。
 
 脚本与 LIBERO 入口一样关闭系统/进程/GPU-memory telemetry；资源配额与告警交由平台。数据完整性、等价性、NaN/Inf、checkpoint lineage 和质量门不会关闭。
 
 ## 3. 中断恢复与重新开 lineage
 
-任意时刻中断后，使用 2.2 完全相同的命令重新执行。converter 会跳过已发布 episode，Stage 1/2/3 会从各自 `checkpoint_latest.pt` 精确恢复。
+任意时刻中断后，使用 2.2 完全相同的命令重新执行。converter 会跳过已发布 episode，Stage 1/2/3 会从各自 `checkpoint_latest.pt` 精确恢复。若原始 backbone、DINO 与数据身份不变，已经通过 formal audit/equivalence 的 CALVIN feature store 可以复用，不需要因为 loss 改动重新编码。
+
+2026-07-20 之前的 `calvin_abc_original_openvla_h16_v1` 是 50,000-step 旧 loss lineage。它必须保留用于比较，但不得在当前代码下续接；v2 的 horizon weighting、delta normalization/cosine、100,000-step scheduler 与 mechanism checkpoint 都属于新的恢复合同。
 
 以下情况必须换新的 `--run-id`，不能续接旧 checkpoint：
 
@@ -145,4 +147,3 @@ cd "$MOWE_ROOT"
 ```
 
 正式评测必须使用 Stage 3 `checkpoint_best.pt`、其保存的 execution config 和 CALVIN 独立 action adapter；不得复用 LIBERO statistics/checkpoint，也不得把离线 loss 或 adapter smoke 当作 simulator success rate。
-

@@ -24,6 +24,11 @@ class CalvinLauncher(start_mtp.Launcher):
     def default_skill_config_path(self) -> Path:
         return self.report_root / "calvin_skill_experts.json"
 
+    def early_stop_patience(self, stage_name: str) -> int:
+        if stage_name == "stage1":
+            return int(self.args.stage1_early_stop_patience)
+        return super().early_stop_patience(stage_name)
+
     def raw_data_quick_signature(self) -> str:
         digest = hashlib.sha256()
         for shard in sorted(
@@ -116,8 +121,17 @@ class CalvinLauncher(start_mtp.Launcher):
             raise ValueError("--validation-freq must be positive.")
         if not math.isfinite(self.args.early_stop_min_delta) or self.args.early_stop_min_delta < 0:
             raise ValueError("--early-stop-min-delta must be non-negative.")
-        if self.args.early_stop_patience < 1 or self.args.early_stop_min_steps < 100:
+        if (
+            self.args.early_stop_patience < 1
+            or self.args.stage1_early_stop_patience < 1
+            or self.args.early_stop_min_steps < 100
+        ):
             raise ValueError("Invalid early-stopping patience/minimum steps.")
+        if self.args.stage1_max_steps < 70000:
+            raise ValueError(
+                "CALVIN v2 Stage 1 requires at least 70,000 steps so the "
+                "mechanism checkpoint and schedule-aware early stopping are reachable."
+            )
         if self.args.min_validation_episodes < 2:
             raise ValueError("--min-validation-episodes must be at least 2.")
         if self.args.encode_batch_size < 1 or self.args.episodes_per_shard < 1:
@@ -308,6 +322,9 @@ class CalvinLauncher(start_mtp.Launcher):
             "dino_checkpoint": str(self.args.dino_checkpoint.resolve()),
             "samples": self.args.equivalence_samples,
             "raw_data_quick_signature": self.raw_data_quick_signature(),
+            "stage1_runtime_config_sha256": hashlib.sha256(
+                Path(self.runtime_configs["stage1"]).read_bytes()
+            ).hexdigest(),
         }
         if (
             self.args.force_static_audits
@@ -412,7 +429,7 @@ def parse_args() -> argparse.Namespace:
         "--stage3-config",
         default="configs/mowe_wam/ddp8_calvin_joint_flow_feature_store.yaml",
     )
-    parser.add_argument("--stage1-max-steps", type=int, default=50000)
+    parser.add_argument("--stage1-max-steps", type=int, default=100000)
     parser.add_argument("--stage2-max-steps", type=int, default=50000)
     parser.add_argument("--stage3-max-steps", type=int, default=50000)
     parser.add_argument("--flow-solver-steps", type=int, default=4)
@@ -421,6 +438,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-freq", type=int, default=500)
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4)
     parser.add_argument("--early-stop-patience", type=int, default=5)
+    parser.add_argument("--stage1-early-stop-patience", type=int, default=10)
     parser.add_argument("--early-stop-min-steps", type=int, default=5000)
     parser.add_argument("--min-validation-episodes", type=int, default=32)
     parser.add_argument(

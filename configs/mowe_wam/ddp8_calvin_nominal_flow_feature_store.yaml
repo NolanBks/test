@@ -42,6 +42,17 @@
     "split_seed": 1701
   },
   "skill_expert_config": "TBD/calvin_skill_experts.json",
+  "world_prediction_loss": {
+    "horizon_weights": [0.25, 1.0, 1.0, 1.0],
+    "delta_rms_normalization": {
+      "mode": "batch_horizon",
+      "floor": 0.05
+    },
+    "delta_cosine": {
+      "mode": "magnitude_aware",
+      "scale": 0.10
+    }
+  },
   "long_run_readiness": {
     "max_unattested_steps": 100,
     "report_path": null
@@ -51,7 +62,7 @@
     "precision": "bf16",
     "batch_size": 1,
     "grad_accumulation_steps": 1,
-    "max_steps": 50000,
+    "max_steps": 100000,
     "learning_rates": {
       "view_fusion": 0.0001,
       "memory_encoder": 0.0001,
@@ -87,10 +98,19 @@
       "enabled": true,
       "metric": "total_loss",
       "min_delta": 0.0001,
-      "patience": 5,
-      "min_steps": 35000,
+      "patience": 10,
+      "min_steps": 70000,
       "validation_mode": "deployment",
       "require_schedule_completion": true
+    },
+    "mechanism_checkpoint": {
+      "enabled": true,
+      "metric": "smooth_l1",
+      "baseline": "current_copy_smooth_l1",
+      "horizons": [4, 8, 16],
+      "min_steps": 70000,
+      "required_min_horizon_improvement": -0.05,
+      "min_action_distance_gate": 0.10
     }
   }
 }

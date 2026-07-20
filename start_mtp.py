@@ -165,6 +165,7 @@ def stage1_quality_gate(
     latest = max(eligible, key=lambda record: int(record.get("step", -1)))
     errors = []
     improvements = {}
+    delta_improvements = {}
     for horizon in (4, 8, 16):
         metrics = latest.get("future_horizon_metrics", {}).get(str(horizon), {})
         predicted = metrics.get("smooth_l1")
@@ -178,6 +179,13 @@ def stage1_quality_gate(
             errors.append(f"horizon_{horizon}_copy_baseline_nonpositive")
             continue
         improvements[str(horizon)] = 1.0 - float(predicted) / float(baseline)
+        delta_predicted = metrics.get("delta_smooth_l1")
+        if isinstance(delta_predicted, (int, float)) and math.isfinite(
+            float(delta_predicted)
+        ):
+            delta_improvements[str(horizon)] = 1.0 - float(
+                delta_predicted
+            ) / float(baseline)
     average_improvement = (
         sum(improvements.values()) / len(improvements) if improvements else float("-inf")
     )
@@ -215,6 +223,12 @@ def stage1_quality_gate(
         "sampling_contract": latest.get("sampling_contract"),
         "fractional_improvement_over_copy_current": improvements,
         "average_improvement": average_improvement,
+        "delta_fractional_improvement_over_copy_current": delta_improvements,
+        "delta_average_improvement": (
+            sum(delta_improvements.values()) / len(delta_improvements)
+            if delta_improvements
+            else None
+        ),
         "required_average_improvement": float(required_average_improvement),
         "required_min_horizon_improvement": float(
             required_min_horizon_improvement
@@ -505,13 +519,31 @@ class Launcher:
                         "enabled": True,
                         "metric": "total_loss",
                         "min_delta": self.args.early_stop_min_delta,
-                        "patience": self.args.early_stop_patience,
+                        "patience": self.early_stop_patience(name),
                         "min_steps": effective_early_stop_min_steps,
                         "validation_mode": "deployment",
                         "require_schedule_completion": True,
                     },
                 }
             )
+            mechanism_checkpoint = validation.get("mechanism_checkpoint")
+            if isinstance(mechanism_checkpoint, dict) and bool(
+                mechanism_checkpoint.get("enabled", False)
+            ):
+                mechanism_checkpoint.update(
+                    {
+                        "min_steps": effective_early_stop_min_steps,
+                        "required_average_improvement": (
+                            self.args.stage1_quality_average_improvement
+                        ),
+                        "required_min_horizon_improvement": (
+                            self.args.stage1_quality_min_horizon_improvement
+                        ),
+                        "min_action_distance_gate": (
+                            self.args.stage1_quality_min_action_gate
+                        ),
+                    }
+                )
             inherited_distributed = config["training"].get("distributed", {})
             config["training"]["distributed"] = {
                 "enabled": "auto",
@@ -534,6 +566,10 @@ class Launcher:
             destination = config_root / f"{name}.json"
             atomic_json(destination, config)
             self.runtime_configs[name] = str(destination)
+
+    def early_stop_patience(self, stage_name: str) -> int:
+        del stage_name
+        return int(self.args.early_stop_patience)
 
     def default_skill_config_path(self) -> Path:
         return self.report_root / "skill_experts_h16.json"
@@ -845,12 +881,7 @@ class Launcher:
                 "stage1_quality_gate", status="dry_run", report=str(report_path)
             )
             return report
-        best_checkpoint = stage_dir / "checkpoint_best.pt"
-        selected_checkpoint = (
-            best_checkpoint
-            if best_checkpoint.is_file()
-            else stage_dir / "checkpoint_latest.pt"
-        )
+        selected_checkpoint = self.selected_stage1_checkpoint(stage_dir)
         selected_metadata = checkpoint_metadata(
             selected_checkpoint, "nominal_flow_pretrain"
         )
@@ -921,6 +952,35 @@ class Launcher:
         atomic_json(self.report_root / f"{stage}_smoke_gate.json", {"passed": True, **result})
         return result
 
+    def selected_stage1_checkpoint(self, stage_dir: Path) -> Path:
+        """Select the contract-bound Stage-1 predecessor for gating and Stage 2."""
+
+        runtime = load_json(Path(self.runtime_configs["stage1"]))
+        mechanism_cfg = runtime.get("validation", {}).get(
+            "mechanism_checkpoint", {}
+        )
+        if bool(mechanism_cfg.get("enabled", False)):
+            checkpoint = stage_dir / "checkpoint_best_mechanism.pt"
+            report_path = stage_dir / "mechanism_checkpoint.json"
+            metadata = checkpoint_metadata(checkpoint, "nominal_flow_pretrain")
+            if metadata is None or not report_path.is_file():
+                raise RuntimeError(
+                    "Stage 1 mechanism checkpoint is required by the resolved "
+                    f"config but is missing: {checkpoint}"
+                )
+            report = load_json(report_path)
+            if (
+                report.get("format") != "mowe_stage1_mechanism_checkpoint_v1"
+                or int(report.get("best_step", -1)) != int(metadata["step"])
+            ):
+                raise RuntimeError(
+                    "Stage 1 mechanism checkpoint/report generation mismatch; "
+                    "do not initialize Stage 2 from an unverified predecessor."
+                )
+            return checkpoint
+        best = stage_dir / "checkpoint_best.pt"
+        return best if best.is_file() else stage_dir / "checkpoint_latest.pt"
+
     def train_stage1(self) -> Path:
         output = self.stage_root / "stage1"
         checkpoint = output / "checkpoint_latest.pt"
@@ -977,8 +1037,11 @@ class Launcher:
                 log_freq=self.args.long_log_freq,
                 expected_stage="nominal_flow_pretrain",
             )
-        best = output / "checkpoint_best.pt"
-        return best if not self.args.dry_run and best.is_file() else checkpoint
+        return (
+            self.selected_stage1_checkpoint(output)
+            if not self.args.dry_run
+            else checkpoint
+        )
 
     def train_stage2(self, predecessor: Path) -> Path:
         output = self.stage_root / "stage2"

@@ -10,6 +10,7 @@ except ModuleNotFoundError:
     torch = None
 
 from mowe_wam.training import flow_wam_skill_losses
+from mowe_wam.training.latent_losses import delta_prediction_components
 from mowe_wam.data.libero_sequence_dataset import build_episode_windows
 from mowe_wam.data import (
     ShardedVisualTargetCache,
@@ -47,6 +48,53 @@ class FlowTorchTests(unittest.TestCase):
         self.weights = load_config("configs/mowe_wam/train_flow_wam_skill_moe.yaml")[
             "loss_weights"
         ]
+
+    def test_magnitude_aware_delta_loss_suppresses_zero_change_cosine(self):
+        prediction = torch.ones((1, 4, 2, 3), dtype=torch.float32)
+        target = torch.zeros_like(prediction)
+        mask = torch.ones((1, 4), dtype=torch.bool)
+        cosine, smooth, diagnostics = delta_prediction_components(
+            prediction,
+            target,
+            mask,
+            horizon_weight=torch.tensor([0.25, 1.0, 1.0, 1.0]),
+            config={
+                "delta_rms_normalization": {
+                    "mode": "batch_horizon",
+                    "floor": 0.05,
+                },
+                "delta_cosine": {
+                    "mode": "magnitude_aware",
+                    "scale": 0.10,
+                },
+            },
+        )
+        self.assertEqual(float(cosine), 0.0)
+        self.assertGreater(float(smooth), 0.0)
+        self.assertEqual(float(diagnostics["delta_cosine_weight_mean"]), 0.0)
+        self.assertEqual(float(diagnostics["delta_target_rms_mean"]), 0.0)
+
+    def test_delta_rms_ignores_masked_future_targets(self):
+        prediction = torch.zeros((2, 4, 1, 2), dtype=torch.float32)
+        target = torch.full_like(prediction, 0.2)
+        target[1] = 1000.0
+        mask = torch.tensor(
+            [[True, True, True, True], [False, False, False, False]]
+        )
+        _, _, diagnostics = delta_prediction_components(
+            prediction,
+            target,
+            mask,
+            config={
+                "delta_rms_normalization": {
+                    "mode": "batch_horizon",
+                    "floor": 0.05,
+                }
+            },
+        )
+        self.assertAlmostEqual(
+            float(diagnostics["delta_target_rms_mean"]), 0.2, places=6
+        )
 
     def test_validation_loss_early_stopping_is_resume_stable(self):
         def record(step, loss):
@@ -400,6 +448,22 @@ class FlowTorchTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "Same-stage resume"):
                 validate_resume_schedule_contract(metadata, changed_schedule)
+            changed_world_loss = load_config(
+                "configs/mowe_wam/train_flow_wam_skill_moe.yaml"
+            )
+            changed_world_loss["training"].update(
+                {
+                    "device": "cpu",
+                    "precision": "float32",
+                    "max_steps": 2,
+                    "stop_step": 2,
+                }
+            )
+            changed_world_loss["world_prediction_loss"] = {
+                "horizon_weights": [0.25, 1.0, 1.0, 1.0]
+            }
+            with self.assertRaisesRegex(ValueError, "Same-stage resume"):
+                validate_resume_schedule_contract(metadata, changed_world_loss)
             unchanged_schedule = load_config(
                 "configs/mowe_wam/train_flow_wam_skill_moe.yaml"
             )

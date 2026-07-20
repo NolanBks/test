@@ -355,13 +355,18 @@ def main() -> None:
                     for name in output_keys
                 }
                 raw_losses = flow_wam_skill_losses(
-                    raw_output, raw_batch, cfg["loss_weights"], stage=args.stage
+                    raw_output,
+                    raw_batch,
+                    cfg["loss_weights"],
+                    stage=args.stage,
+                    world_prediction_config=cfg.get("world_prediction_loss"),
                 )
                 cached_losses = flow_wam_skill_losses(
                     cached_output,
                     cached_batch,
                     cfg["loss_weights"],
                     stage=args.stage,
+                    world_prediction_config=cfg.get("world_prediction_loss"),
                 )
                 loss_errors = {
                     name: abs(float(raw_losses[name]) - float(cached_losses[name]))

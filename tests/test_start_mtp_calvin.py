@@ -67,7 +67,7 @@ class CalvinMtpLauncherTests(unittest.TestCase):
                 "ddp_stage1_2_25",
                 "ddp_stage1_25_100",
                 "ddp_stage1_100_1000",
-                "ddp_stage1_1000_50000",
+                "ddp_stage1_1000_100000",
                 "ddp_stage2_0_100",
                 "ddp_stage2_100_50000",
                 "ddp_stage3_0_100",
@@ -84,7 +84,32 @@ class CalvinMtpLauncherTests(unittest.TestCase):
             )
             stage1 = json.loads((run / "configs/stage1.json").read_text())
             self.assertEqual(stage1["data"]["dataset_names"], ["calvin_abc_rlds"])
-            self.assertEqual(stage1["training"]["max_steps"], 50000)
+            self.assertEqual(stage1["training"]["max_steps"], 100000)
+            self.assertEqual(
+                stage1["world_prediction_loss"]["horizon_weights"],
+                [0.25, 1.0, 1.0, 1.0],
+            )
+            self.assertEqual(
+                stage1["world_prediction_loss"]["delta_rms_normalization"]["mode"],
+                "batch_horizon",
+            )
+            self.assertEqual(
+                stage1["world_prediction_loss"]["delta_cosine"]["mode"],
+                "magnitude_aware",
+            )
+            self.assertTrue(
+                stage1["validation"]["mechanism_checkpoint"]["enabled"]
+            )
+            self.assertEqual(
+                stage1["validation"]["early_stopping"]["min_steps"], 70000
+            )
+            self.assertEqual(
+                stage1["validation"]["early_stopping"]["patience"], 10
+            )
+            stage2 = json.loads((run / "configs/stage2.json").read_text())
+            self.assertEqual(
+                stage2["validation"]["early_stopping"]["patience"], 5
+            )
             self.assertFalse(stage1["training"]["distributed"]["resource_monitoring"])
             self.assertEqual(
                 stage1["skill_expert_config"],

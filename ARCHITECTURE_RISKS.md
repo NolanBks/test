@@ -1,6 +1,6 @@
 # MoWE-WAM 架构风险登记表
 
-更新时间：2026-07-17（单机 DDP/feature store 与 LIBERO + CALVIN 双基准修订）
+更新时间：2026-07-20（CALVIN Stage 1 多尺度 loss 与长训练合同修订）
 
 本文档记录当前主方案“Nominal Flow Policy + Verb-Seeded Residual Flow Skill Experts + MAW Routing”中必须持续检查的概念、训练和评测风险。它不是实验结果，也不是可选的审稿意见清单；`PROJECT_PLAN.md` 负责研究方向，`IMPLEMENTATION_PLAN.md` 负责落地方式，本文档负责定义不得被实现悄悄破坏的边界和验收门槛。
 
@@ -129,7 +129,9 @@ z*(t+H)       : 未来 spatial visual tokens
 H             : [1, 4, 8, 16]
 ```
 
-损失必须同时包含 cosine、Smooth L1 和 delta 项。分析必须加入 `copy_current` 基线，并按 motion magnitude 分桶报告误差。Stage 1 晋级使用跨 H=4/8/16 的平均改善而不是要求每个聚合点绝对 Pareto 占优：平均改善至少 10%，且任一 horizon 相对回退不得超过 5%，避免短时域强 copy baseline 的微小波动误阻塞明显改善的中长时域预测。
+损失必须同时包含 cosine、Smooth L1 和 delta 项。分析必须加入 `copy_current` 基线，并按 motion magnitude 分桶报告误差。Stage 1 晋级使用跨 H=4/8/16 的平均改善而不是要求每个聚合点绝对 Pareto 占优：平均改善至少 10%，且任一 horizon 相对回退不得超过 5%，避免短时域强 copy baseline 的微小波动误阻塞明显改善的中长时域预测。CALVIN v2 保留 H=1 表征监督但将四 horizon 权重设为 `0.25/1/1/1`，delta 使用带 floor 的 batch/horizon RMS normalization；近零 target 的 cosine 按 delta magnitude 降权，禁止用未加权方向损失主导总梯度。
+
+Stage 1 early stopping 仍只看 deployment total loss，但进入 Stage 2 的权重选择必须与 future-quality 门禁一致：启用机制选择时同时保存 `checkpoint_best_mechanism.pt`，按 H=4/8/16 absolute future improvement 排序并检查 episode diversity、action-distance gate 与双视角未塌缩。不得用 total-loss best 代替，也不得把表现较好的 delta 指标冒充 absolute future 门禁通过。
 
 ### R4：Router 绕过 future signal
 
@@ -245,7 +247,7 @@ same-stage resume 必须额外锁定完整 scheduler/optimization contract：`ma
 
 正式长训练必须迁移到 `IMPLEMENTATION_PLAN.md` 10.2 节定义的两层数据结构：LeRobot 风格 canonical archive 负责保留原始多模态数据，MoWE feature store 负责训练热路径。由于第一版冻结 OpenVLA 且关闭 image augmentation，paired OpenVLA view features、instruction feature 和 DINO targets 可以离线缓存；训练时从 memory-mapped fixed-shape arrays 构造与现有 window contract 等价的 sample。
 
-截至 2026-07-19，feature-store writer、mmap Dataset、precomputed backbone、episode-aware sampler、sampler resume 与结构/等价性审计均已实现；feature pending episode 有原子索引/checksum，rank 内采用 shard-aware block shuffle，策略与 block size 属于 checkpoint 恢复契约。通用 runtime 的资源诊断工具仍保留给独立运维使用，但一键入口固定 `resource_monitoring=false`，不调用 soak、resource runtime audit 或 resource readiness。R29 因此由 formal store/checksum、100-window 等价性、无 TensorFlow/视频热路径、8-rank assignment 和真实长训练稳定性来约束；平台资源风险不由训练脚本闭环。
+截至 2026-07-20，feature-store writer、mmap Dataset、precomputed backbone、episode-aware sampler、sampler resume 与结构/等价性审计均已实现；feature pending episode 有原子索引/checksum，rank 内采用 shard-aware block shuffle，策略与 block size 属于 checkpoint 恢复契约。通用 runtime 的资源诊断工具仍保留给独立运维使用，但一键入口固定 `resource_monitoring=false`，不调用 soak、resource runtime audit 或 resource readiness。R29 因此由 formal store/checksum、100-window 等价性、无 TensorFlow/视频热路径、8-rank assignment 和真实长训练稳定性来约束；平台资源风险不由训练脚本闭环。
 
 关键边界：
 
@@ -321,6 +323,7 @@ CALVIN 被选定不代表 benchmark 已经跑通。代码已固定官方仓库 c
 - Teacher cache metadata 与 checkpoint/transform 完全匹配。
 - 真实一个 optimizer step loss/gradient 有限。
 - 日志包含 nominal/final action distance、world/delta loss、expert usage、router entropy 和 cache fingerprint。
+- 启用 CALVIN v2 loss 时，日志还必须包含 delta cosine/Smooth-L1 分量、raw delta Smooth-L1、cosine magnitude weight 和 target RMS；resolved config/checkpoint 必须绑定 horizon weights 与 normalization/cosine 参数。
 - 2-rank synthetic DDP 更新后参数 checksum 一致；2-rank 小型 Flow-WAM feature-store run 能保存 step N 并由新进程恢复到 N+1，且两 rank RNG/sampler cursor 与 rank-0 单写日志连续。8-rank episode shard 无交集且 union 完整，sidecar `_traj_index`/label 不因 sharding 改变。
 - rank 0 是唯一 JSONL/checkpoint writer；原始-backbone Stage 1 从 world-size 8 的 step 0 新建 lineage，不恢复旧 OFT-backbone 单卡 checkpoint。
 - 8 卡 step 0→2 smoke 和 2→4 resume 通过，八卡持续工作且 checkpoint step/scheduler/参数一致；随后通过 25-step 与 100-step 压力门禁。

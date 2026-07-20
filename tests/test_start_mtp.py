@@ -13,6 +13,89 @@ import start_mtp
 
 
 class MtpLauncherTests(unittest.TestCase):
+    def test_stage1_mechanism_checkpoint_prefers_gate_aligned_validation(self):
+        from mowe_wam.training.flow_runtime import (
+            stage1_mechanism_checkpoint_state,
+        )
+
+        def record(step, predicted, total_loss):
+            return {
+                "stage": "nominal_flow_pretrain",
+                "step": step,
+                "validation_mode": "deployment",
+                "unique_episodes": 878,
+                "sampling_contract": "episode_balanced_deterministic_v1",
+                "metrics": {"total_loss": total_loss},
+                "future_horizon_metrics": {
+                    str(horizon): {
+                        "smooth_l1": value,
+                        "current_copy_smooth_l1": 1.0,
+                    }
+                    for horizon, value in zip((4, 8, 16), predicted)
+                },
+                "deployment_metrics": {
+                    "mean_nominal_action_distance_gate": 0.5,
+                    "current_view_weights_mean": [0.45, 0.55],
+                },
+            }
+
+        state = stage1_mechanism_checkpoint_state(
+            [
+                record(70000, (1.40, 0.95, 0.70), 0.50),
+                record(70500, (0.98, 0.82, 0.75), 0.60),
+            ],
+            min_steps=70000,
+        )
+        self.assertEqual(state["best_step"], 70500)
+        self.assertTrue(state["current_is_best"])
+        self.assertTrue(state["best"]["passes_mechanism_thresholds"])
+
+    def test_launcher_requires_mechanism_checkpoint_when_configured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / "stage1"
+            stage.mkdir()
+            runtime = root / "stage1.json"
+            runtime.write_text(
+                json.dumps(
+                    {
+                        "validation": {
+                            "mechanism_checkpoint": {"enabled": True}
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            launcher = object.__new__(start_mtp.Launcher)
+            launcher.runtime_configs = {"stage1": str(runtime)}
+            with self.assertRaisesRegex(RuntimeError, "mechanism checkpoint"):
+                launcher.selected_stage1_checkpoint(stage)
+
+            checkpoint = stage / "checkpoint_best_mechanism.pt"
+            checkpoint.write_bytes(b"checkpoint")
+            checkpoint.with_suffix(".pt.metadata.json").write_text(
+                json.dumps(
+                    {
+                        "format": "flow_wam_skill_components_v2",
+                        "stage": "nominal_flow_pretrain",
+                        "step": 70500,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (stage / "mechanism_checkpoint.json").write_text(
+                json.dumps(
+                    {
+                        "format": "mowe_stage1_mechanism_checkpoint_v1",
+                        "best_step": 70500,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                launcher.selected_stage1_checkpoint(stage), checkpoint
+            )
+
     def test_execute_invokes_each_training_stage_once(self):
         launcher = object.__new__(start_mtp.Launcher)
         launcher.args = Namespace(dry_run=True)

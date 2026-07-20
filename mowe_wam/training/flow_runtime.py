@@ -182,6 +182,42 @@ def validate_flow_config(cfg: dict[str, Any]) -> None:
         raise ValueError(f"Flow-WAM synchronous-16 contract mismatch: {invalid}")
     if data.get("future_horizons") != [1, 4, 8, 16]:
         raise ValueError("Flow-WAM synchronous-16 requires data.future_horizons=[1,4,8,16].")
+    world_loss = dict(cfg.get("world_prediction_loss") or {})
+    horizon_weights = world_loss.get("horizon_weights")
+    if horizon_weights is not None:
+        if (
+            not isinstance(horizon_weights, list)
+            or len(horizon_weights) != len(data["future_horizons"])
+            or any(
+                not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) <= 0
+                for value in horizon_weights
+            )
+        ):
+            raise ValueError(
+                "world_prediction_loss.horizon_weights must contain four "
+                "finite positive values aligned with [1,4,8,16]."
+            )
+    rms_cfg = dict(world_loss.get("delta_rms_normalization") or {})
+    if str(rms_cfg.get("mode", "none")) not in {"none", "batch_horizon"}:
+        raise ValueError("Unsupported delta RMS normalization mode.")
+    if str(rms_cfg.get("mode", "none")) != "none" and (
+        not math.isfinite(float(rms_cfg.get("floor", 0.05)))
+        or float(rms_cfg.get("floor", 0.05)) <= 0
+    ):
+        raise ValueError("Delta RMS normalization floor must be positive.")
+    cosine_cfg = dict(world_loss.get("delta_cosine") or {})
+    if str(cosine_cfg.get("mode", "uniform")) not in {
+        "uniform",
+        "magnitude_aware",
+    }:
+        raise ValueError("Unsupported delta cosine weighting mode.")
+    if str(cosine_cfg.get("mode", "uniform")) == "magnitude_aware" and (
+        not math.isfinite(float(cosine_cfg.get("scale", 0.10)))
+        or float(cosine_cfg.get("scale", 0.10)) <= 0
+    ):
+        raise ValueError("Magnitude-aware delta cosine scale must be positive.")
     if int(router.get("schedule_length", 0)) != 16:
         raise ValueError("Flow-WAM synchronous-16 requires router.schedule_length=16.")
     if flow.get("formulation") != "conditional_rectified_flow" or flow.get("solver") != "euler":
@@ -896,6 +932,7 @@ def _resume_training_contract(cfg: dict[str, Any]) -> dict[str, Any]:
             )
         },
         "loss_weights": cfg.get("loss_weights", {}),
+        "world_prediction_loss": cfg.get("world_prediction_loss", {}),
         "router_schedule": {
             name: router.get(name)
             for name in (
@@ -1849,6 +1886,8 @@ def _mechanism_metrics(outputs, batch):
                 continue
             pred_value = predicted[valid, index]
             target_value = target[valid, index]
+            pred_delta_value = predicted_delta[valid, index]
+            target_delta_value = target_delta[valid, index]
             copy_value = current[valid]
             horizon_metrics[str(int(horizon))] = {
                 "cosine_distance": float(
@@ -1862,8 +1901,17 @@ def _mechanism_metrics(outputs, batch):
                 ),
                 "delta_smooth_l1": float(
                     torch.nn.functional.smooth_l1_loss(
-                        predicted_delta[valid, index], target_delta[valid, index]
+                        pred_delta_value, target_delta_value
                     ).detach()
+                ),
+                "delta_cosine_distance": float(
+                    1.0
+                    - torch.nn.functional.cosine_similarity(
+                        pred_delta_value, target_delta_value, dim=-1
+                    ).mean().detach()
+                ),
+                "delta_target_rms": float(
+                    target_delta_value.square().mean().sqrt().detach()
                 ),
                 "current_copy_smooth_l1": float(
                     torch.nn.functional.smooth_l1_loss(copy_value, target_value).detach()
@@ -2036,6 +2084,150 @@ def validation_loss_early_stopping_state(
         "min_unique_episodes": int(min_unique_episodes),
         "current_is_best": best_step is not None and best_step == current_step,
         "should_stop": should_stop,
+    }
+
+
+def stage1_mechanism_checkpoint_state(
+    records: list[dict[str, Any]],
+    *,
+    metric: str = "smooth_l1",
+    baseline: str = "current_copy_smooth_l1",
+    horizons: tuple[int, ...] = (4, 8, 16),
+    min_steps: int = 0,
+    validation_mode: str = "deployment",
+    min_unique_episodes: int = 32,
+    required_average_improvement: float = 0.10,
+    required_min_horizon_improvement: float = -0.05,
+    min_action_distance_gate: float = 0.10,
+) -> dict[str, Any]:
+    """Choose the Stage-1 checkpoint that best matches the future-quality gate.
+
+    Deployment total loss remains the early-stopping signal.  This independent
+    selector prevents action/gripper or noisy delta terms from deciding which
+    checkpoint is handed to the Stage-1 mechanism gate and Stage 2.
+    """
+
+    latest_by_step: dict[int, dict[str, Any]] = {}
+    for record in records:
+        if (
+            record.get("stage") == "nominal_flow_pretrain"
+            and record.get("validation_mode") == validation_mode
+        ):
+            latest_by_step[int(record.get("step", -1))] = record
+    current_step = max(latest_by_step, default=-1)
+    candidates = []
+    rejection_counts: dict[str, int] = {}
+
+    def reject(reason: str) -> None:
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
+    for step, record in sorted(latest_by_step.items()):
+        if step < int(min_steps):
+            reject("before_min_steps")
+            continue
+        if int(record.get("unique_episodes", 0)) < int(min_unique_episodes):
+            reject("insufficient_unique_episodes")
+            continue
+        if record.get("sampling_contract") != "episode_balanced_deterministic_v1":
+            reject("sampling_contract_mismatch")
+            continue
+        deployment = record.get("deployment_metrics", {})
+        action_gate = float(deployment.get("mean_nominal_action_distance_gate", 0.0))
+        if not math.isfinite(action_gate) or action_gate < float(min_action_distance_gate):
+            reject("action_distance_gate_invalid")
+            continue
+        view_weights = deployment.get("current_view_weights_mean", [])
+        if not (
+            len(view_weights) == 2
+            and all(
+                isinstance(value, (int, float)) and math.isfinite(float(value))
+                for value in view_weights
+            )
+            and math.isclose(
+                sum(float(value) for value in view_weights),
+                1.0,
+                rel_tol=0.0,
+                abs_tol=1e-4,
+            )
+            and min(float(value) for value in view_weights) >= 0.05
+        ):
+            reject("view_weights_invalid")
+            continue
+        improvements = {}
+        for horizon in horizons:
+            values = record.get("future_horizon_metrics", {}).get(
+                str(int(horizon)), {}
+            )
+            predicted = values.get(metric)
+            copy_value = values.get(baseline)
+            if not (
+                isinstance(predicted, (int, float))
+                and isinstance(copy_value, (int, float))
+                and math.isfinite(float(predicted))
+                and math.isfinite(float(copy_value))
+                and float(copy_value) > 0
+            ):
+                improvements = {}
+                break
+            improvements[str(int(horizon))] = 1.0 - float(predicted) / float(
+                copy_value
+            )
+        if len(improvements) != len(horizons):
+            reject("future_metrics_invalid")
+            continue
+        average = sum(improvements.values()) / len(improvements)
+        minimum = min(improvements.values())
+        total_loss = float(record.get("metrics", {}).get("total_loss", float("inf")))
+        if not math.isfinite(total_loss):
+            total_loss = float("inf")
+        passes_floor = minimum >= float(required_min_horizon_improvement)
+        passes_gate = passes_floor and average >= float(required_average_improvement)
+        candidates.append(
+            {
+                "step": int(step),
+                "average_improvement": float(average),
+                "minimum_horizon_improvement": float(minimum),
+                "fractional_improvement_over_copy_current": improvements,
+                "total_loss": total_loss,
+                "passes_horizon_floor": passes_floor,
+                "passes_mechanism_thresholds": passes_gate,
+                "mean_nominal_action_distance_gate": action_gate,
+                "current_view_weights_mean": [float(value) for value in view_weights],
+            }
+        )
+
+    best = max(
+        candidates,
+        key=lambda item: (
+            bool(item["passes_mechanism_thresholds"]),
+            bool(item["passes_horizon_floor"]),
+            float(item["average_improvement"]),
+            float(item["minimum_horizon_improvement"]),
+            -float(item["total_loss"]),
+            int(item["step"]),
+        ),
+        default=None,
+    )
+    return {
+        "format": "mowe_stage1_mechanism_checkpoint_v1",
+        "stage": "nominal_flow_pretrain",
+        "validation_mode": validation_mode,
+        "metric": metric,
+        "baseline": baseline,
+        "horizons": [int(value) for value in horizons],
+        "min_steps": int(min_steps),
+        "min_unique_episodes": int(min_unique_episodes),
+        "required_average_improvement": float(required_average_improvement),
+        "required_min_horizon_improvement": float(
+            required_min_horizon_improvement
+        ),
+        "min_action_distance_gate": float(min_action_distance_gate),
+        "current_step": current_step,
+        "candidate_count": len(candidates),
+        "rejection_counts": rejection_counts,
+        "best_step": None if best is None else int(best["step"]),
+        "best": best,
+        "current_is_best": best is not None and int(best["step"]) == current_step,
     }
 
 
@@ -2392,6 +2584,7 @@ def evaluate_flow_model(
                         batch,
                         cfg["loss_weights"],
                         stage=stage,
+                        world_prediction_config=cfg.get("world_prediction_loss"),
                     )
                 mechanism = _mechanism_metrics(outputs, batch)
                 route = _route_metrics(outputs, batch)
@@ -2792,6 +2985,16 @@ def _run_flow_training_impl(
     validation_cfg = cfg.get("validation", {})
     validation_freq = int(validation_cfg.get("eval_freq", 500))
     early_stopping_cfg = validation_cfg.get("early_stopping", {})
+    mechanism_checkpoint_cfg = dict(
+        validation_cfg.get("mechanism_checkpoint") or {}
+    )
+    mechanism_checkpoint_enabled = bool(
+        mechanism_checkpoint_cfg.get("enabled", False)
+    )
+    if mechanism_checkpoint_enabled and stage != "nominal_flow_pretrain":
+        raise ValueError(
+            "validation.mechanism_checkpoint is supported only for Stage 1."
+        )
     early_stopping_enabled = bool(early_stopping_cfg.get("enabled", False))
     early_stopping_metric = str(early_stopping_cfg.get("metric", "total_loss"))
     early_stopping_min_delta = float(early_stopping_cfg.get("min_delta", 1e-4))
@@ -2806,6 +3009,7 @@ def _run_flow_training_impl(
     )
     min_validation_episodes = int(validation_cfg.get("min_unique_episodes", 1))
     early_stopping_report_path = output_dir / "early_stopping.json"
+    mechanism_checkpoint_report_path = output_dir / "mechanism_checkpoint.json"
     if bool(validation_cfg.get("enabled", False)) and validation_freq < 1:
         raise ValueError("validation.eval_freq must be positive.")
     if early_stopping_enabled and not bool(validation_cfg.get("enabled", False)):
@@ -2820,6 +3024,37 @@ def _run_flow_training_impl(
             min_steps=early_stopping_min_steps,
             validation_mode=early_stopping_mode,
             min_unique_episodes=min_validation_episodes,
+        )
+    if mechanism_checkpoint_enabled:
+        stage1_mechanism_checkpoint_state(
+            [],
+            metric=str(mechanism_checkpoint_cfg.get("metric", "smooth_l1")),
+            baseline=str(
+                mechanism_checkpoint_cfg.get(
+                    "baseline", "current_copy_smooth_l1"
+                )
+            ),
+            horizons=tuple(
+                int(value)
+                for value in mechanism_checkpoint_cfg.get(
+                    "horizons", [4, 8, 16]
+                )
+            ),
+            min_steps=int(mechanism_checkpoint_cfg.get("min_steps", 0)),
+            min_unique_episodes=min_validation_episodes,
+            required_average_improvement=float(
+                mechanism_checkpoint_cfg.get(
+                    "required_average_improvement", 0.10
+                )
+            ),
+            required_min_horizon_improvement=float(
+                mechanism_checkpoint_cfg.get(
+                    "required_min_horizon_improvement", -0.05
+                )
+            ),
+            min_action_distance_gate=float(
+                mechanism_checkpoint_cfg.get("min_action_distance_gate", 0.10)
+            ),
         )
     if accumulation < 1 or log_freq < 1 or save_freq < 1:
         raise ValueError(
@@ -2953,6 +3188,7 @@ def _run_flow_training_impl(
                     schedule_state={"enable_load_balance": route_mode != "oracle"},
                     stage=stage,
                     class_weights=class_weights,
+                    world_prediction_config=cfg.get("world_prediction_loss"),
                 )
                 scaled_loss = losses["total_loss"] / accumulation
             if device.startswith("cuda"):
@@ -3124,11 +3360,13 @@ def _run_flow_training_impl(
         ):
             distributed.barrier()
             early_stopping_state = None
+            mechanism_checkpoint_state = None
             if distributed.is_main:
                 run_validation(step)
+                validation_records = _read_jsonl_records(validation_log_path)
                 if early_stopping_enabled:
                     early_stopping_state = validation_loss_early_stopping_state(
-                        _read_jsonl_records(validation_log_path),
+                        validation_records,
                         stage=stage,
                         metric=early_stopping_metric,
                         min_delta=early_stopping_min_delta,
@@ -3137,7 +3375,51 @@ def _run_flow_training_impl(
                         validation_mode=early_stopping_mode,
                         min_unique_episodes=min_validation_episodes,
                     )
+                if mechanism_checkpoint_enabled:
+                    mechanism_checkpoint_state = stage1_mechanism_checkpoint_state(
+                        validation_records,
+                        metric=str(
+                            mechanism_checkpoint_cfg.get("metric", "smooth_l1")
+                        ),
+                        baseline=str(
+                            mechanism_checkpoint_cfg.get(
+                                "baseline", "current_copy_smooth_l1"
+                            )
+                        ),
+                        horizons=tuple(
+                            int(value)
+                            for value in mechanism_checkpoint_cfg.get(
+                                "horizons", [4, 8, 16]
+                            )
+                        ),
+                        min_steps=int(
+                            mechanism_checkpoint_cfg.get("min_steps", 0)
+                        ),
+                        min_unique_episodes=min_validation_episodes,
+                        required_average_improvement=float(
+                            mechanism_checkpoint_cfg.get(
+                                "required_average_improvement", 0.10
+                            )
+                        ),
+                        required_min_horizon_improvement=float(
+                            mechanism_checkpoint_cfg.get(
+                                "required_min_horizon_improvement", -0.05
+                            )
+                        ),
+                        min_action_distance_gate=float(
+                            mechanism_checkpoint_cfg.get(
+                                "min_action_distance_gate", 0.10
+                            )
+                        ),
+                    )
+                    _write_json_atomic(
+                        mechanism_checkpoint_report_path,
+                        mechanism_checkpoint_state,
+                    )
             early_stopping_state = distributed.broadcast_object(early_stopping_state)
+            mechanism_checkpoint_state = distributed.broadcast_object(
+                mechanism_checkpoint_state
+            )
             distributed.barrier()
             if resource_monitoring_enabled:
                 validation_resources = process_resource_metrics(distributed)
@@ -3165,6 +3447,34 @@ def _run_flow_training_impl(
                 if distributed.is_main:
                     save_flow_checkpoint(
                         output_dir / "checkpoint_best.pt",
+                        raw_model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        step,
+                        cfg,
+                        stage,
+                        schedule_state,
+                        distributed_metadata=cfg["distributed_contract"],
+                        rng_state_by_rank=rng_state_by_rank,
+                        sampler_state_by_rank=sampler_state_by_rank,
+                    )
+                distributed.barrier()
+            if mechanism_checkpoint_state and bool(
+                mechanism_checkpoint_state.get("current_is_best", False)
+            ):
+                rng_state_by_rank = distributed.all_gather_objects(
+                    local_rng_state(distributed)
+                )
+                local_sampler_state = sampler.state_dict() if isinstance(
+                    sampler, EpisodeAwareDistributedSampler
+                ) else None
+                sampler_state_by_rank = distributed.all_gather_objects(
+                    local_sampler_state
+                )
+                if distributed.is_main:
+                    save_flow_checkpoint(
+                        output_dir / "checkpoint_best_mechanism.pt",
                         raw_model,
                         optimizer,
                         scheduler,

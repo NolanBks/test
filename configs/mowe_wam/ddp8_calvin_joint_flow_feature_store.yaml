@@ -38,6 +38,17 @@
     "split_seed": 1701
   },
   "skill_expert_config": "TBD/calvin_skill_experts.json",
+  "world_prediction_loss": {
+    "horizon_weights": [0.25, 1.0, 1.0, 1.0],
+    "delta_rms_normalization": {
+      "mode": "batch_horizon",
+      "floor": 0.05
+    },
+    "delta_cosine": {
+      "mode": "magnitude_aware",
+      "scale": 0.10
+    }
+  },
   "long_run_readiness": {
     "max_unattested_steps": 100,
     "report_path": null

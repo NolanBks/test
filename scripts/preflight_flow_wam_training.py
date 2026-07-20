@@ -210,7 +210,13 @@ def real_preflight(args):
         flow_seed=7,
         compute_residual=stage != "nominal_flow_pretrain",
     )
-    losses = flow_wam_skill_losses(output, batch, cfg["loss_weights"], stage=stage)
+    losses = flow_wam_skill_losses(
+        output,
+        batch,
+        cfg["loss_weights"],
+        stage=stage,
+        world_prediction_config=cfg.get("world_prediction_loss"),
+    )
     if args.backward:
         losses["total_loss"].backward()
     return model, batch, output, losses
