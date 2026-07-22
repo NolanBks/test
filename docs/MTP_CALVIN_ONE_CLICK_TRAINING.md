@@ -93,6 +93,20 @@ ddp_stage3_100_50000
 
 dry-run 通过后，仅删除末尾 `--dry-run`，其余参数保持完全一致：
 
+cd /home/ma-user/work/algorithm/chaoxintao_2/MoWE/MoWE
+
+python start_mtp.py \
+  --repo-root /home/ma-user/work/algorithm/chaoxintao_2/MoWE/MoWE \
+  --data-root /home/ma-user/work/algorithm/chaoxintao_2/MoWE/libero_cot_rlds \
+  --feature-store /home/ma-user/work/algorithm/chaoxintao_2/MoWE/mowe_store/libero_h16_formal_4090 \
+  --openvla-checkpoint /home/ma-user/work/algorithm/chaoxintao_2/MoWE/openvla-7b \
+  --openvla-revision 47a0ec7fc4ec123775a391911046cf33cf9ed83f \
+  --dino-checkpoint /home/ma-user/work/algorithm/chaoxintao_2/MoWE/facebook-dinov2-small \
+  --skill-sidecar /home/ma-user/work/algorithm/chaoxintao_2/MoWE/libero_cot_rlds/cot_file.json \
+  --run-root-dir /home/ma-user/work/algorithm/chaoxintao_2/MoWE/outputs \
+  --run-id libero_original_openvla_h16_v2 \
+  --dry-run
+
 ```bash
 cd "$MOWE_ROOT"
 

@@ -16,6 +16,7 @@
 ### 当前代码事实
 
 - Stage 1/2/3 Flow-WAM、DDP、feature store、canonical archive、readiness、LIBERO evaluator、CALVIN adapter/converter/evaluator 的代码路径已存在。
+- `start_mtp_calvin.sh` 已固定 ModelArts 单节点 8 GPU、`mowe` Conda Python 和服务器 CALVIN/OpenVLA/DINO/store/run 路径；它不使用 Accelerate/DeepSpeed，启动前会检查环境、512 shard 与 dry-run 合同，然后才进入可恢复正式链。
 - `flow_wam_base.yaml` 已有 `vla_path=openvla/openvla-7b`，但 CLI `checkpoint` 会覆盖它；正式转换/训练/评测必须传入固定 revision 的原始模型本地 snapshot。
 - 原始 backbone identity 已实现为 repo + 40 位 revision + config/processor/weights SHA-256 指纹；store、checkpoint、equivalence readiness 和 evaluator 已按该 identity fail closed，不再用服务器绝对路径作为语义身份。
 - Residual expert 的训练 target、采样 endpoint 与诊断统一使用逐 timestep `max_residual_l2=0.5` 投影，该值已进入 same-stage resume contract。
@@ -57,6 +58,39 @@
 3. 小样本 gate 通过后按 seeds `7/17/27` 运行四 suite 每任务 50 trials，并用独立 JSONL + `--resume-results` 恢复。
 4. CALVIN 使用新的 `calvin_abc_original_openvla_h16_v2` run-id 从 Stage 1 step 0 启动；可复用身份未变且已通过 formal audit/equivalence 的 feature store，但不得恢复 v1 的 50k checkpoint。
 5. 评测不使用 sudo/EGL，不加入系统或内存监控；资源配额与告警继续由 MTP 平台承担。
+
+## 2026-07-20 - ModelArts CALVIN v2 单节点一键启动脚本
+
+### Goal
+
+使用用户确认的 ModelArts 绝对路径、`mowe` Conda 环境和单节点 8 GPU 合同，提供不经 Accelerate/DeepSpeed 的 CALVIN v2 一键入口。
+
+### Changed
+
+- 新增 `start_mtp_calvin.sh`，固定服务器 repo、CALVIN RLDS、OpenVLA、DINO、feature store、outputs 与 40 位 OpenVLA revision。
+- 修正旧 `start.sh` 参考中 CUDA `LD_LIBRARY_PATH` 缺少分隔符的风险；新脚本使用 `mowe` 完整 Python 路径和 CUDA 11.8 目录，但不修改用户现有 `start.sh`。
+- 正式启动前 fail closed 检查必需目录、512 个 shard、Torch/CUDA/BF16、8 GPU、Transformers/TensorFlow/TFDS/Prismatic import，再先运行 launcher dry-run。
+- 支持 `MOWE_CALVIN_DRY_RUN_ONLY=1` 只运行预检，支持 `MOWE_CALVIN_RUN_ID` 显式开新 lineage；默认 run-id 为 `calvin_abc_original_openvla_h16_v2`。
+
+### Commands Run
+
+```bash
+bash -n start_mtp_calvin.sh
+git diff --check
+```
+
+### Result
+
+- 脚本语法与 diff whitespace 检查通过。
+- 本地不存在 ModelArts 绝对路径与 8 GPU，因此本轮未执行服务器环境预检、dry-run 或 optimizer step。
+
+### Issues
+
+- 服务器实际 `mowe` 环境仍必须通过脚本内的 CUDA/BF16/8-GPU 和 Python import 检查；若 Torch 自带 CUDA runtime 与指定 CUDA 11.8 toolkit 不兼容，脚本会在正式链前暴露问题。
+
+### Next
+
+- 在 ModelArts 先使用 `MOWE_CALVIN_DRY_RUN_ONLY=1 bash start_mtp_calvin.sh` 核对预检输出；通过后直接执行 `bash start_mtp_calvin.sh`。
 
 ## 2026-07-20 - CALVIN Stage 1 多尺度 loss 与 mechanism checkpoint v2
 
